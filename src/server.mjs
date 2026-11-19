@@ -370,6 +370,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           rerank: { type: 'boolean', description: '是否精排（默认 false：工程库实测 90% vs 92% 打平，但每次多 120–200ms；只在需要语义泛化时显式置 true）' },
           deep: { type: 'boolean', description: '深挖档：候选与重排扩到更深（默认按库规模自适应，571 卡→26 / 5413 卡→80，封顶 80），单次成本更高' },
           include_deleted: { type: 'boolean', description: '是否包含已归档（status: deleted）的卡：默认 false（它们代表结论已不再成立）；查历史决策时置 true' },
+          scope: {
+            type: 'array', items: { type: 'string' },
+            description: '按 scope 收窄，如 ["domain:code"]。卡片 frontmatter 的 scope 字段命中任一即保留；不传则完全不过滤（默认行为不变）',
+          },
         },
         required: ['query'],
       },
@@ -486,6 +490,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const DEFAULT_LIMIT = Math.min(Math.max(Number(process.env.MEM_DEFAULT_LIMIT) || PROFILE.limit, 1), 20)
     const limit = Math.min(Math.max(Number(args.limit) || DEFAULT_LIMIT, 1), 20)
     const includeDeleted = args.include_deleted === true
+    // scope：显式传入才过滤；不传保持旧行为。取值来自卡片 frontmatter 的 scope 字段。
+    const scope = Array.isArray(args.scope) ? args.scope.map((x) => String(x).trim()).filter(Boolean) : null
     // 实测（2026-11-13，工程库 59 条人工标注，标注已放宽为多可接受卡）：
     //   无 rerank top1 92% / top3 100%；加 rerank 后 top1 73% / top3 97%。
     // 工程记忆是「精确找那张卡」，重排的语义泛化会换成相关但非目标卡，故默认关闭。
@@ -527,11 +533,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const bmQ = expandAliases(q)
     if (qvec && vectorOn) {
       // 融合顺序与 limit 无关（内部两路各取 200 再 RRF），取满 fetchN 让后续去重有牌可打
-      const r = idx.hybridQuery(q, { limit: fetchN, qvec, titleW, includeDeleted, bm25Query: bmQ })
+      const r = idx.hybridQuery(q, { limit: fetchN, qvec, titleW, includeDeleted, bm25Query: bmQ, scope })
       ranked = r.ranked
       mode = r.mode
     } else {
-      ranked = idx.query(bmQ, { limit: fetchN, includeDeleted, titleW }).ranked
+      ranked = idx.query(bmQ, { limit: fetchN, includeDeleted, titleW, scope }).ranked
       mode = 'bm25'
     }
     if (bmQ !== q) mode += '+alias'

@@ -94,6 +94,10 @@ function parseCardFile(text) {
     return ''
   }
   const tags = (scalar('tags') || '').replace(/^\[|\]$/g, '').split(',').map((t) => t.trim()).filter(Boolean)
+  // scope：跨域收窄用（belief 卡自带 domain:code / domain:writing / user:universal）。
+  // 只做结构化读取，不在检索层猜测语义；不传 scope 时完全不过滤。
+  const scopeRaw = scalar('scope') || ''
+  const scope = scopeRaw.replace(/^\[|\]$/g, '').split(',').map((t) => t.trim()).filter(Boolean)
 
   // 原子块：只认我们自己的字段名（见 memory-migrate-v2.mjs 的注释）
   const atoms = []
@@ -120,6 +124,7 @@ function parseCardFile(text) {
     kind: scalar('kind'),
     status: scalar('status') || 'pending',
     tags,
+    scope,
     atoms,
   }
 }
@@ -140,7 +145,7 @@ export async function build() {
   const db = new DatabaseSync(DB_PATH)
   db.exec(`
     PRAGMA journal_mode=WAL;
-    CREATE TABLE cards (id TEXT PRIMARY KEY, path TEXT, title TEXT, kind TEXT, status TEXT, mtime INTEGER);
+    CREATE TABLE cards (id TEXT PRIMARY KEY, path TEXT, title TEXT, kind TEXT, status TEXT, mtime INTEGER, scope TEXT);
     CREATE TABLE atoms (id TEXT PRIMARY KEY, card_id TEXT, text TEXT, nature TEXT, subject TEXT,
                         active INTEGER, evidence TEXT, conf REAL, len INTEGER);
     CREATE TABLE postings (token TEXT, atom_id TEXT, tf INTEGER, PRIMARY KEY (token, atom_id));
@@ -149,7 +154,7 @@ export async function build() {
     CREATE INDEX idx_atoms_card ON atoms(card_id);
   `)
   const files = await walk(VAULT)
-  const insCard = db.prepare('INSERT OR REPLACE INTO cards VALUES (?,?,?,?,?,?)')
+  const insCard = db.prepare('INSERT OR REPLACE INTO cards (id,path,title,kind,status,mtime,scope) VALUES (?,?,?,?,?,?,?)')
   const insAtom = db.prepare('INSERT OR REPLACE INTO atoms VALUES (?,?,?,?,?,?,?,?,?)')
   const insPost = db.prepare('INSERT OR REPLACE INTO postings VALUES (?,?,?)')
   const insTag = db.prepare('INSERT OR REPLACE INTO atom_tags VALUES (?,?)')
@@ -163,7 +168,7 @@ export async function build() {
     if (!card) continue
     const cid = crypto.createHash('sha1').update(rel).digest('hex').slice(0, 12)
     const st = await fs.stat(path.join(VAULT, rel))
-    insCard.run(cid, rel, card.title, card.kind, card.status, Math.round(st.mtimeMs))
+    insCard.run(cid, rel, card.title, card.kind, card.status, Math.round(st.mtimeMs), (card.scope || []).join(','))
     nCards++
     // 标题原子：标题是人/模型都认可的概括，单列一条保证可检索
     {
@@ -256,18 +261,34 @@ export function countCards({ includeDeleted = true } = {}) {
 }
 
 /** @returns {{ranked: Array<{cardId,path,title,score,atom,hitTokens}>, stats}} */
-export function query(q, { limit = 10, minScore = 0, includeDeleted = false, activeOnly = !includeDeleted, titleW = TITLE_W, k1 = K1, b = B, titlePrior = TITLE_PRIOR } = {}) {
+/** scope 过滤：只在显式传入且索引有 scope 列时生效，否则返回 null（不过滤）。
+ *  2026-11-20 之前建的索引没有 scope 列，这里静默降级——加字段不改旧库行为。 */
+function resolveScope(db, scope) {
+  const list = Array.isArray(scope) ? scope.map((x) => String(x).trim()).filter(Boolean) : []
+  if (!list.length) return null
+  try {
+    const has = db.prepare("SELECT COUNT(*) c FROM pragma_table_info('cards') WHERE name = 'scope'").get().c > 0
+    return has ? list : null
+  } catch { return null }
+}
+
+export function query(q, { limit = 10, minScore = 0, includeDeleted = false, activeOnly = !includeDeleted, titleW = TITLE_W, k1 = K1, b = B, titlePrior = TITLE_PRIOR, scope = null } = {}) {
   const { db, avgdl, N } = openIndex()
   const terms = [...tokenize(q).keys()]
   if (!terms.length) { db.close(); return { ranked: [], stats: { terms: 0 } } }
   const ph = terms.map(() => '?').join(',')
+  const scopeList = resolveScope(db, scope)
+  const scopeClause = scopeList
+    ? ` AND c.scope IS NOT NULL AND c.scope != '' AND (${scopeList.map(() => 'c.scope LIKE ?').join(' OR ')})`
+    : ''
+  const scopeArgs = scopeList ? scopeList.map((x) => `%${x}%`) : []
   const rows = db.prepare(`
     SELECT p.token, p.tf, p.atom_id, a.card_id, a.text, a.len, a.nature
     FROM postings p JOIN atoms a ON a.id = p.atom_id
       LEFT JOIN cards c ON c.id = a.card_id
     WHERE p.token IN (${ph}) ${activeOnly ? 'AND a.active = 1' : ''}
-      ${includeDeleted ? '' : "AND COALESCE(c.status,'') != 'deleted'"}
-  `).all(...terms)
+      ${includeDeleted ? '' : "AND COALESCE(c.status,'') != 'deleted'"}${scopeClause}
+  `).all(...terms, ...scopeArgs)
   const df = db.prepare(`SELECT token, COUNT(DISTINCT atom_id) df FROM postings WHERE token IN (${ph}) GROUP BY token`).all(...terms)
   const dfMap = new Map(df.map((r) => [r.token, r.df]))
   const idf = (t) => Math.log((N - (dfMap.get(t) || 0) + 0.5) / ((dfMap.get(t) || 0) + 0.5) + 1)
@@ -466,11 +487,11 @@ export function classifyQuery(q) {
   return tech ? 'tech' : 'semantic'
 }
 
-export function hybridQuery(q, { limit = 5, qvec = null, k = 60, weights = null, titleW = TITLE_W, k1 = K1, b = B, includeDeleted = false, bm25Query = null } = {}) {
+export function hybridQuery(q, { limit = 5, qvec = null, k = 60, weights = null, titleW = TITLE_W, k1 = K1, b = B, includeDeleted = false, bm25Query = null, scope = null } = {}) {
   // bm25Query：抽取式改写只作用在词法这一路，向量路仍用原 query。
   // 理由：改写会引入原句没有的词，拿它去算 embedding 等于让改写污染语义检索；
   // 而 BM25 本来就是词面匹配，别名扩展（k8s → kubernetes）正是它需要的。
-  const bm = query(bm25Query || q, { limit: 200, includeDeleted, titleW, k1, b })
+  const bm = query(bm25Query || q, { limit: 200, includeDeleted, titleW, k1, b, scope })
   const lists = [bm.ranked.map((h) => ({ cardId: h.cardId }))]
   // 记录每张卡命中的原子，供输出层展示「为什么匹配」。
   const hitsByCard = new Map()
@@ -486,11 +507,17 @@ export function hybridQuery(q, { limit = 5, qvec = null, k = 60, weights = null,
     if (v) {
       const hits = vectorTopK(qvec, v, 200)
       const db = new DatabaseSync(DB_PATH, { readOnly: true })
-      const atomCard = new Map(db.prepare(
-        includeDeleted
-          ? 'SELECT id, card_id FROM atoms'
-          : "SELECT a.id, a.card_id FROM atoms a LEFT JOIN cards c ON c.id = a.card_id WHERE COALESCE(c.status,'') != 'deleted'",
-      ).all().map((r) => [r.id, r.card_id]))
+      // 向量路同样要过 scope：否则融合会把 scope 外的卡从 dense 一路带回来，
+      // BM25 那路过滤就白做了。
+      const vScope = resolveScope(db, scope)
+      let vSql = 'SELECT a.id, a.card_id FROM atoms a LEFT JOIN cards c ON c.id = a.card_id WHERE 1=1'
+      const vArgs = []
+      if (!includeDeleted) vSql += " AND COALESCE(c.status,'') != 'deleted'"
+      if (vScope) {
+        vSql += ` AND c.scope IS NOT NULL AND c.scope != '' AND (${vScope.map(() => 'c.scope LIKE ?').join(' OR ')})`
+        vArgs.push(...vScope.map((x) => `%${x}%`))
+      }
+      const atomCard = new Map(db.prepare(vSql).all(...vArgs).map((r) => [r.id, r.card_id]))
       db.close()
       const seen = new Set()
       const seq = []
