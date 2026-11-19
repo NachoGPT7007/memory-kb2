@@ -1,0 +1,22 @@
+{
+  "note": "抽取式改写的别名表：只做确定性的词扩展，不做生成、不引入新概念。别名表独立于任何评测集，可人工维护。匹配规则：英文按词边界、中文按子串；命中后把 canonical 词追加到查询串（只作用于 BM25 路，向量路仍用原 query）。",
+  "version": 1,
+  "updated": "2026-11-20",
+  "entries": [
+    { "aliases": ["k8s", "kube"], "canonical": "kubernetes" },
+    { "aliases": ["ts"], "canonical": "typescript" },
+    { "aliases": ["js"], "canonical": "javascript" },
+    { "aliases": ["gha"], "canonical": "github actions" },
+    { "aliases": ["pg", "postgres"], "canonical": "postgresql" },
+    { "aliases": ["mongo"], "canonical": "mongodb" },
+    { "aliases": ["reactjs"], "canonical": "react" },
+    { "aliases": ["vscode"], "canonical": "visual studio code" },
+    { "aliases": ["cf"], "canonical": "cloudflare" },
+    { "aliases": ["es"], "canonical": "elasticsearch" },
+    { "aliases": ["mq"], "canonical": "message queue" },
+    { "aliases": ["orm"], "canonical": "object relational mapping" },
+    { "aliases": ["善意受让", "善意受让人"], "canonical": "善意取得" },
+    { "aliases": ["物债二分", "物权债权二分"], "canonical": "物权行为与债权行为区分" },
+    { "aliases": ["表见代理"], "canonical": "无权代理 表见" }
+  ]
+}

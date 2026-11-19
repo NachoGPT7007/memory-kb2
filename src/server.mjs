@@ -16,10 +16,42 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { DatabaseSync } from 'node:sqlite'
-import { promises as fsp } from 'node:fs'
+import { promises as fsp, readFileSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import * as api from './embed-api.mjs'
+
+// ---- 抽取式改写（别名扩展，确定性，零生成）--------------------------------
+// 只作用于词法路：hybridQuery 的 bm25Query 参数把改写限制在 BM25，向量路仍用原 query
+// （改写引入的词不该污染 embedding）。别名表是独立数据文件，可人工维护。
+// 默认关：2026-11-20 实测 PrecisionMemBench 76 条断言只多通过 1 条（13.2%→14.5%），
+// 落在 ±2 条噪声带内；工程库 59 条不变。收益过小，因此保留 MEM_ALIAS=1 开关而不默认启用。
+const ALIAS_ON = process.env.MEM_ALIAS === '1'
+const ALIAS_FILE = process.env.MEM_ALIAS_FILE || new URL('./alias-table.json', import.meta.url).pathname
+let aliasTable = null
+function loadAliasTable() {
+  if (aliasTable !== null) return aliasTable
+  try {
+    const raw = JSON.parse(readFileSync(ALIAS_FILE, 'utf8'))
+    aliasTable = (raw.entries || [])
+      .flatMap((e) => (e.aliases || []).map((a) => ({ alias: String(a).trim(), canonical: String(e.canonical || '').trim() })))
+      .filter((x) => x.alias && x.canonical)
+  } catch { aliasTable = [] }
+  return aliasTable
+}
+const aliasHit = (q, w) => {
+  if (/^[A-Za-z0-9 ._-]+$/.test(w)) {
+    const esc = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return new RegExp(`(^|[^A-Za-z0-9])${esc}([^A-Za-z0-9]|$)`, 'i').test(q)
+  }
+  return q.includes(w)
+}
+function expandAliases(q) {
+  if (!ALIAS_ON) return q
+  const add = []
+  for (const { alias, canonical } of loadAliasTable()) if (aliasHit(q, alias)) add.push(canonical)
+  return add.length ? `${q} ${[...new Set(add)].join(' ')}` : q
+}
 
 const VAULT = process.env.MEM_VAULT || path.join(os.homedir(), '.memory-vault')
 const DB = path.join(VAULT, '.index', 'memory.sqlite')
@@ -492,15 +524,17 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (local) { qvec = await local(q); lastNote += '，已切本地模型' }
       }
     }
+    const bmQ = expandAliases(q)
     if (qvec && vectorOn) {
       // 融合顺序与 limit 无关（内部两路各取 200 再 RRF），取满 fetchN 让后续去重有牌可打
-      const r = idx.hybridQuery(q, { limit: fetchN, qvec, titleW, includeDeleted })
+      const r = idx.hybridQuery(q, { limit: fetchN, qvec, titleW, includeDeleted, bm25Query: bmQ })
       ranked = r.ranked
       mode = r.mode
     } else {
-      ranked = idx.query(q, { limit: fetchN, includeDeleted, titleW }).ranked
+      ranked = idx.query(bmQ, { limit: fetchN, includeDeleted, titleW }).ranked
       mode = 'bm25'
     }
+    if (bmQ !== q) mode += '+alias'
 
     // 2) 重排：一次批量请求
     if (useRerank && ranked.length > 1) {

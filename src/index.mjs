@@ -466,8 +466,11 @@ export function classifyQuery(q) {
   return tech ? 'tech' : 'semantic'
 }
 
-export function hybridQuery(q, { limit = 5, qvec = null, k = 60, weights = null, titleW = TITLE_W, k1 = K1, b = B, includeDeleted = false } = {}) {
-  const bm = query(q, { limit: 200, includeDeleted, titleW, k1, b })
+export function hybridQuery(q, { limit = 5, qvec = null, k = 60, weights = null, titleW = TITLE_W, k1 = K1, b = B, includeDeleted = false, bm25Query = null } = {}) {
+  // bm25Query：抽取式改写只作用在词法这一路，向量路仍用原 query。
+  // 理由：改写会引入原句没有的词，拿它去算 embedding 等于让改写污染语义检索；
+  // 而 BM25 本来就是词面匹配，别名扩展（k8s → kubernetes）正是它需要的。
+  const bm = query(bm25Query || q, { limit: 200, includeDeleted, titleW, k1, b })
   const lists = [bm.ranked.map((h) => ({ cardId: h.cardId }))]
   // 记录每张卡命中的原子，供输出层展示「为什么匹配」。
   const hitsByCard = new Map()
