@@ -162,7 +162,7 @@ CLI 和 MCP 服务走同一条检索链路（两路召回 + RRF + 去重），�
 
 完整数据集、指标定义与全部实验数字见 [docs/BENCHMARK.md](./docs/BENCHMARK.md)。
 
-**本项目没有向公开榜提交过成绩。** 与 chat-memory-benchmark 1.0 / 2.2 的关系、以及为什么自测数字不能直接和榜上 A 分比较，写在 [BENCHMARK 第 10 节](./docs/BENCHMARK.md)——那一节也列出了聊天域偏弱、只在两个合成人物上测过这些坏消息。
+**本项目没有向公开榜提交过成绩。** PrecisionMemBench（纯检索断言基准）实测 34/76 = 44.7%，短板在 scope 过滤、user 隔离与别名解析——详见 [BENCHMARK 第 11 节](./docs/BENCHMARK.md)。 与 chat-memory-benchmark 1.0 / 2.2 的关系、以及为什么自测数字不能直接和榜上 A 分比较，写在 [BENCHMARK 第 10 节](./docs/BENCHMARK.md)——那一节也列出了聊天域偏弱、只在两个合成人物上测过这些坏消息。
 
 ---
 
