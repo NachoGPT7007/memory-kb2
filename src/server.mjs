@@ -43,6 +43,44 @@ const POOL_MIN = Number(process.env.MEM_POOL_MIN) || 20
 const POOL_MAX = Number(process.env.MEM_POOL_MAX) || 80
 const DEEP = Number(process.env.RERANK_DEEP_CANDIDATES) || 50
 
+/**
+ * 查询向量缓存（2026-11-20 新增）。
+ *
+ * 一次检索的 166ms 里有九成是 embedding 往返，而同一个 query 的向量永远相同。
+ * 个人使用时调试会反复问同一件事，缓存命中率不低。
+ *
+ * 两条安全边界：
+ *   1. 含时间词的 query 不缓存——「今天」「刚才」的结果会随时间变化
+ *   2. TTL 5 分钟——即使漏了时间词，也不会拿到太旧的结果
+ * 环境变量：MEM_QVEC_CACHE=0 关闭；MEM_QVEC_TTL 改 TTL；MEM_QVEC_MAX 改容量
+ */
+const QVEC_CACHE_ON = process.env.MEM_QVEC_CACHE !== '0'
+const QVEC_TTL_MS = Number(process.env.MEM_QVEC_TTL) || 5 * 60 * 1000
+const QVEC_CACHE_MAX = Number(process.env.MEM_QVEC_MAX) || 1000
+const qvecCache = new Map()
+let qvecHits = 0
+let qvecMisses = 0
+
+/** 含时间词的 query 不走缓存。 */
+const TIME_WORD = /今天|今晚|昨天|现在|当前|刚才|刚刚|本周|这周|本月|这个月|最近\s*\d|today|now|yesterday|current/i
+
+async function embedQueryCached(q) {
+  if (!QVEC_CACHE_ON || TIME_WORD.test(q)) return api.embedOne(q)
+  const now = Date.now()
+  const hit = qvecCache.get(q)
+  if (hit !== undefined && now - hit.at < QVEC_TTL_MS) {
+    qvecHits += 1
+    qvecCache.delete(q)
+    qvecCache.set(q, hit) // 移到末尾，维持 LRU 顺序
+    return hit.vec
+  }
+  const vec = await api.embedOne(q)
+  qvecMisses += 1
+  qvecCache.set(q, { vec, at: now })
+  if (qvecCache.size > QVEC_CACHE_MAX) qvecCache.delete(qvecCache.keys().next().value)
+  return vec
+}
+
 /** 按库规模算候选深度；MEM_POOL 显式给值时优先。 */
 function adaptivePool() {
   if (POOL_FIXED) return POOL_FIXED
@@ -342,6 +380,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       ? `API 调用 ${st.calls} 次，失败 ${st.fail} 次；最近 ${st.lastStatus ?? '-'}，${st.lastMs ?? '-'}ms${st.lastError ? `，错误：${st.lastError}` : ''}`
       : 'API 尚未调用（首次检索时验证）'
     const localLine = `本地兜底：embedding ${localEmbedState} / reranker ${localRerankState}（未加载不占内存）`
+    const cacheTotal = qvecHits + qvecMisses
+    const cacheLine = QVEC_CACHE_ON
+      ? `查询向量缓存：命中 ${qvecHits} / 总计 ${cacheTotal}${cacheTotal ? `（${Math.round((qvecHits / cacheTotal) * 100)}%）` : ''}${qvecCache.size ? `，驻留 ${qvecCache.size} 条` : ''}`
+      : '查询向量缓存：已关闭（MEM_QVEC_CACHE=0）'
     return {
       content: [{
         type: 'text',
@@ -351,6 +393,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           apiLine,
           callLine,
           localLine,
+          cacheLine,
           lastNote ? `最近降级：${lastNote}` : null,
           `索引新鲜度：${lastStale.stale ? `落后 ${Math.round(lastStale.lagMs / 60000)} 分钟（已触发同步）` : '最新'}`,
         ].filter(Boolean).join('\n'),
@@ -437,7 +480,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     let qvec = null
     try {
-      qvec = await api.embedOne(q)
+      qvec = await embedQueryCached(q)
     } catch (e) {
       lastNote = `向量化 API 失败：${String(e?.message || e).slice(0, 60)}`
       const local = await ensureLocalEmbed()
