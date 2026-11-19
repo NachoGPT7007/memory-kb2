@@ -134,7 +134,7 @@ async function walk(dir, base = dir, acc = []) {
   return acc
 }
 
-async function build() {
+export async function build() {
   await fs.mkdir(path.dirname(DB_PATH), { recursive: true })
   await fs.rm(DB_PATH, { force: true })
   const db = new DatabaseSync(DB_PATH)

@@ -5,16 +5,21 @@
   "type": "module",
   "main": "./src/server.mjs",
   "bin": {
-    "memory-kb2": "./src/server.mjs"
+    "memory-kb2": "./bin/memory-kb2.mjs",
+    "memory-kb2-mcp": "./src/server.mjs"
   },
   "scripts": {
-    "index": "node src/index.mjs",
-    "selfcheck": "node scripts/selfcheck.mjs"
+    "index": "node bin/memory-kb2.mjs index",
+    "search": "node bin/memory-kb2.mjs search",
+    "stats": "node bin/memory-kb2.mjs stats",
+    "selfcheck": "node bin/memory-kb2.mjs selfcheck",
+    "serve": "node bin/memory-kb2.mjs serve"
   },
   "engines": {
     "node": ">=22"
   },
   "files": [
+    "bin",
     "src",
     "scripts",
     "README.md",

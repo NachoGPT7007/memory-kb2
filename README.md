@@ -39,7 +39,8 @@ MCP 记忆库：把本地 Markdown 卡片变成可检索的长期记忆。BM25 �
 
 检索与索引是两条链路，共用一份索引：
 
-- **检索**：Client → MCP server → Index（BM25 + 向量两路召回）→ RRF 融合 → 去重 → 返回
+- **两个入口**：MCP Client（给 AI 用，经 stdio 服务）与 CLI（给人用，直接读写索引）
+- **检索**：入口 → Index（BM25 + 向量两路召回）→ RRF 融合 → 去重 → 返回
 - **索引**：vault（Markdown）→ indexer（切原子 + 分词）→ Index
 - **可选路径**：Embedding API 提供查询向量，Rerank API 做精排——两条都可关闭
 - **Profile 路由**：启动时按语料特征判一次，换库不用改配置
@@ -112,25 +113,30 @@ flowchart TB
 
 ## Quick start
 
+### 命令行：给人用
+
 ```bash
 git clone https://github.com/NachoGPT7007/memory-kb2 && cd memory-kb2
 npm install
 
-# 建索引（默认读 ~/.memory-vault）
-MEM_VAULT=~/.memory-vault npm run index
-
-# 自检
-npm run selfcheck
+npx memory-kb2 index                     # 建索引（读 $MEM_VAULT，默认 ~/.memory-vault）
+npx memory-kb2 stats                     # 库有多大、倒排多少项、归档几张
+npx memory-kb2 search "候选池为什么"      # 命令行检索，看命中与分数
+npx memory-kb2 selfcheck                 # 本体体检
 ```
 
-接 MCP 客户端：
+也可以 `npm run index` / `npm run stats` / `npm run search -- "..."` / `npm run selfcheck`。
+
+CLI 和 MCP 服务走同一条检索链路（两路召回 + RRF + 去重），区别只是 CLI 没有查询向量时会自动退回 BM25。
+
+### MCP 客户端：给 AI 用
 
 ```json
 {
   "mcpServers": {
     "memory_kb2": {
       "command": "node",
-      "args": ["/absolute/path/to/memory-kb2/src/server.mjs"],
+      "args": ["/absolute/path/to/memory-kb2/bin/memory-kb2.mjs", "serve"],
       "env": { "MEM_VAULT": "/absolute/path/to/your/vault" }
     }
   }
