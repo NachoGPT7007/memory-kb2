@@ -15,3 +15,8 @@ memory-vault/
 *.bak-*
 *.log
 *.tmp
+
+# 架构图构建产物（HTML 与校验回执不入库，只留生成的 PNG）
+.archify/
+docs/assets/*.html
+docs/assets/*.json
