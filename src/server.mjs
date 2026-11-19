@@ -478,16 +478,20 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const concept = isConceptQuery(q)
     const titleW = QUERY_ROUTING ? (concept ? CONCEPT_TITLE_W : DESCRIPTIVE_TITLE_W) : (Number(process.env.MEM_TITLE_W) || PROFILE.titleW)
 
-    let qvec = null
-    try {
-      qvec = await embedQueryCached(q)
-    } catch (e) {
-      lastNote = `向量化 API 失败：${String(e?.message || e).slice(0, 60)}`
-      const local = await ensureLocalEmbed()
-      if (local) { qvec = await local(q); lastNote += '，已切本地模型' }
-    }
-
+    // 向量开关必须在 embedding 之前定：旧实现先无条件调 embedQueryCached 再判断 vectorOn，
+    // 导致 MEM_VECTOR=0 时仍然付一次 embedding 的往返（约 200ms）与调用费，
+    // 「关向量换延迟」这条路是断的（2026-11-20 实测：novector p50 249ms vs baseline 278ms）。
     const vectorOn = process.env.MEM_VECTOR === '0' ? false : process.env.MEM_VECTOR === '1' ? true : PROFILE.vector
+    let qvec = null
+    if (vectorOn) {
+      try {
+        qvec = await embedQueryCached(q)
+      } catch (e) {
+        lastNote = `向量化 API 失败：${String(e?.message || e).slice(0, 60)}`
+        const local = await ensureLocalEmbed()
+        if (local) { qvec = await local(q); lastNote += '，已切本地模型' }
+      }
+    }
     if (qvec && vectorOn) {
       // 融合顺序与 limit 无关（内部两路各取 200 再 RRF），取满 fetchN 让后续去重有牌可打
       const r = idx.hybridQuery(q, { limit: fetchN, qvec, titleW, includeDeleted })
