@@ -86,6 +86,23 @@
 | dense（向量） | 0.434 |
 | 概念名 recall@1 | 98.9%（940 张卡） |
 
+### 5.1 正文入索引后（2026-11-20）
+
+法学卡的章节名（体系位置 / 内容 / 类型·情形 / 效果 / 例外与争议 / 连线 / 溯源 / 待核实）
+不在 `BODY_SECTIONS` 的默认词表里，所以 941 张卡的 385 万字正文**此前完全没有进索引**。
+注入法学词表 + `BODY_MAX` 800 + 剥离 `[[wikilink]]` 后：
+
+| 索引 | 原子 | avgdl | 概念名 recall@1 | 正文细节 top1 |
+|---|---:|---:|---:|---:|
+| 主索引（现状） | 8468 | 34.8 | 98.8% | 87.7% |
+| 影子索引（正文入） | 30227 | 48.6 | 98.7% | **97.6%** |
+
+正文细节 = 从卡片正文抽一段 40–120 字原句当查询，看 top1 是否命中该卡（941 条）。
++93 条题（+9.9pp），概念名 −1 条题（噪声内）。评测脚本 `bench/eval-wiki.mjs`。
+
+**注意**：`titleW=3.0` 是在 avgdl=34.8 的语料上定的，正文入索引后 avgdl 涨到 48.6，
+理论上要重校准。本次实测 recall 未降，所以没动。
+
 密集向量在这个库上是负收益（0.434 < 0.529），所以 wiki 档默认关向量。原因见 [TUNING.md](./TUNING.md#mem_vector--向量开关)：卡片是概念名驱动的，标题即答案。
 
 ---
@@ -138,6 +155,15 @@ MEM_VAULT=/path/to/vault node src/index.mjs
 
 # 自检（只读，可指向生产库）
 node scripts/selfcheck.mjs --vault /path/to/vault
+
+# 工程档（64 条，59 条有效；PASS 判定 93.2 / 100 容差 1 条题）
+node bench/eval-engineering.mjs /tmp/kb2-eng-probe
+
+# PrecisionMemBench（服务层，可选 --alias / --scope）
+node bench/eval-precision.mjs /tmp/pmb --alias --scope
+
+# 法学库两个指标（概念名 recall + 正文细节命中，可指向任意索引）
+node bench/eval-wiki.mjs /tmp/wiki-probe --index /tmp/wiki-probe/.index/memory.sqlite
 
 # 完整检查（含服务层 MCP 往返，只能指向副本）
 node scripts/selfcheck.mjs --vault /tmp/probe-vault --serve
@@ -264,6 +290,20 @@ kb2 在 M01 / M02 上跑的是**自建评测**，指标是「evidence 命中率 
 ### 结果
 
 **10 / 76 = 13.2%**
+
+### 11.1 两项改动的实测（2026-11-20，服务层口径）
+
+评测脚本已改为走真实 MCP stdio 往返（原版直接 import 索引层，测不到服务层改动）：
+
+| 配置 | 通过 | 说明 |
+|---|---:|---|
+| 基线 | 10/76 = 13.2% | BM25 路，limit 10 |
+| + 抽取式改写 | 11/76 = 14.5% | Alias 2/23 → 3/23，只救「纯别名词短查询」；默认关 |
+| + scope 收窄 | 18/76 = 23.7% | Scope 0/12 → 3/12，8 条变好 0 条变差 |
+| + 两者叠加 | **20/76 = 26.3%** | 叠加优于单独，说明作用在不同 case 上 |
+
+**scope 的边界**：实验里 query 的 scope 由评测方直接给出；生产里要靠调用方显式传
+（`memory_search(scope: ["domain:code"])`），或者做一轮 cwd + 词表的自动推断——后者没做。
 
 **这个数字要与官方基线一起看**（同一基准、封存集、各系统官方提交）：
 
