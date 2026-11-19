@@ -112,12 +112,12 @@ npm run index
 
 ---
 
-## 致谢
+## 设计来源
 
-- [Model Context Protocol](https://modelcontextprotocol.io/) 与 `@modelcontextprotocol/sdk` —— MCP 服务骨架
-- [node:sqlite](https://nodejs.org/api/sqlite.html) —— 内建 SQLite，BM25 倒排的落地
-- [阿里云百炼](https://bailian.console.aliyun.com/)（通义千问）—— 向量与重排的默认端点
-- RRF（Reciprocal Rank Fusion）出自 Cormack 等人的 SIGIR 2009 论文
+RRF（Reciprocal Rank Fusion）来自 Cormack、Clarke、Büttcher 在 SIGIR 2009 提出的
+排名融合方法，本项目的混合检索按这一思路实现。
+
+依赖见 `package.json`，不在此列。
 
 ---
 
