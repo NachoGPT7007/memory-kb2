@@ -197,6 +197,23 @@ Issue 用于讨论，PR 欢迎但按现状维护、不承诺跟进节奏。提�
 
 ---
 
+## 设计来源
+
+- **[memory-eternal](https://github.com/EternalNight996/dsh-memory-eternal)**（EternalNight996，MIT）
+  本项目的前身。vault 的卡片结构、以及「对话结束自动沉淀成卡」的思路来自它。
+  kb2 在它之上重写了检索链路：BM25 倒排 + 向量召回 + RRF 融合 + 三档 Profile。
+- **[chat-memory-benchmark](https://github.com/Ornn8/chat-memory-benchmark)**（Ornn8）
+  聊天域题库 M01 / M02 的来源。它是面向**陪伴型** AI 的中文记忆基准，
+  而 kb2 是 Agent 知识库——借它的题库只用于测「长对话里的细节召回」这一项能力，
+  不在于定位相同。哪一档因此冻结，见 [DEBUG-LOG 第 20 轮](./docs/DEBUG-LOG.md)。
+- **[Archify](https://github.com/tt-a1i/archify)**（tt-a1i，`@tt-a1i/archify-dsh`）
+  本 README 架构图的绘制工具。
+- **RRF** —— Cormack、Clarke、Büttcher，SIGIR 2009。
+
+依赖见 `package.json`，不在此列。
+
+---
+
 ## License
 
 MIT。详见 [LICENSE](./LICENSE)。
