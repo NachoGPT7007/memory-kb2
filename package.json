@@ -1,0 +1,39 @@
+{
+  "name": "memory-kb2",
+  "version": "0.4.0",
+  "description": "MCP 记忆库：BM25 + 语义向量 + RRF 融合的本地知识库检索服务",
+  "type": "module",
+  "main": "./src/server.mjs",
+  "bin": {
+    "memory-kb2": "./src/server.mjs"
+  },
+  "scripts": {
+    "index": "node src/index.mjs",
+    "selfcheck": "node scripts/selfcheck.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "memory",
+    "knowledge-base",
+    "bm25",
+    "rrf",
+    "retrieval"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NachoGPT7007/memory-kb2.git"
+  }
+}

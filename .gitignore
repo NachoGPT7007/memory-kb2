@@ -1,0 +1,17 @@
+node_modules/
+package-lock.json
+
+# 索引产物：可随时从 vault 重建
+.index/
+*.sqlite
+*.f32
+
+# 个人知识库内容绝不入库
+vault/
+memory-vault/
+
+# 时间戳备份与日志
+*.bak
+*.bak-*
+*.log
+*.tmp
