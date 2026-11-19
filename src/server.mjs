@@ -16,7 +16,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { DatabaseSync } from 'node:sqlite'
-import { promises as fsp, readFileSync } from 'node:fs'
+import { promises as fsp, readFileSync, existsSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import * as api from './embed-api.mjs'
@@ -53,7 +53,12 @@ function expandAliases(q) {
   return add.length ? `${q} ${[...new Set(add)].join(' ')}` : q
 }
 
-const VAULT = process.env.MEM_VAULT || path.join(os.homedir(), '.memory-vault')
+// vault 解析顺序：显式 MEM_VAULT → DSH_HOME/memory-vault（DSH 生态默认）→ ~/.memory-vault。
+// 2026-11-20 补中间一档：旧实现直接把个人路径硬编码进源码（/home/nachogpt/.dsh-web-lab/memory-vault），
+// 换成仓库版后默认值变成 ~/.memory-vault（不存在）→ memory_stats 报 "unable to open database file"。
+const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+const VAULT = process.env.MEM_VAULT
+  || (existsSync(path.join(DSH_HOME, 'memory-vault')) ? path.join(DSH_HOME, 'memory-vault') : path.join(os.homedir(), '.memory-vault'))
 const DB = path.join(VAULT, '.index', 'memory.sqlite')
 const CACHE = process.env.HF_CACHE || path.join(os.homedir(), '.cache', 'memory-kb2')
 // 2026-11-05 评测：重排候选 10/20/50 的 @1 是 80/82/84、@8 是 86/90/94，单调正向且延迟几乎不涨。

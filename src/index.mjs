@@ -38,6 +38,10 @@ const B = 0.75
 //   描述性查询：TW 1.0 最优，3.0 时下降 3.4pp
 // 调用方可按查询类型覆盖；默认取描述性场景的安全值。
 const TITLE_W = 1.3
+// 覆盖率因子：卡如果只命中查询里的一个泛词，分数打折。指数 0.35 是对中文短查询调的
+// （工程库 59 条）。对代码/长 query（RepoEval 每条 20+ token）它会系统性压低整体匹配度，
+// 2026-11-20 用 MEM_COVER_POW 做成参数，默认仍 0.35（不改旧行为）。
+const COVER_POW = Number(process.env.MEM_COVER_POW ?? 0.35)
 // 标题先验：标题命中的查询词比例越高，卡越可信（wiki bench 的「标题先验 + RRF」做法）。
 // 实测（2026-11-13，工程库 32 条人工标注）：补上后 top1 从 81% → 88%。
 const TITLE_PRIOR = Number(process.env.MEM_TITLE_PRIOR || 0)   // 乘法式标题先验；第 4 轮在“目标卡被 deleted 过滤”的前提下测过，需在有效候选上重测
@@ -355,7 +359,7 @@ export function query(q, { limit = 10, minScore = 0, includeDeleted = false, act
   }
   // 卡级聚合：同一张卡取最高分原子
   // 覆盖率：命中多少个查询词 / 查询词总数。不惩罚会让「命中一个泛词」的卡虚高。
-  const cover = (hits) => Math.pow(hits / Math.max(terms.length, 1), 0.35)
+  const cover = (hits) => (COVER_POW > 0 ? Math.pow(hits / Math.max(terms.length, 1), COVER_POW) : 1)
   for (const a of perAtom.values()) a.score *= cover(a.hits)
   // 标题覆盖率：这张卡的标题原子命中了多少个不同的查询词
   const titleTok = new Map()
