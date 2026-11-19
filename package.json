@@ -23,7 +23,9 @@
     "src",
     "scripts",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "bench",
+    "docs"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2"

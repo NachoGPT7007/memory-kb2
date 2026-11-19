@@ -115,37 +115,52 @@ flowchart TB
 
 ## Quick start
 
+### 安装（两种，都不用等 npm 审核）
+
+```bash
+# 推荐：直接从仓库装（npm registry 上暂时没有这个包）
+npm install -g github:NachoGPT7007/memory-kb2
+
+# 或者 clone 下来用
+git clone https://github.com/NachoGPT7007/memory-kb2 && cd memory-kb2 && npm install
+```
+
 ### 命令行：给人用
 
 ```bash
-git clone https://github.com/NachoGPT7007/memory-kb2 && cd memory-kb2
-npm install
-
-npx memory-kb2 index                     # 建索引（读 $MEM_VAULT，默认 ~/.memory-vault）
-npx memory-kb2 stats                     # 库有多大、倒排多少项、归档几张
-npx memory-kb2 search "候选池为什么"      # 命令行检索，看命中与分数
-npx memory-kb2 selfcheck                 # 本体体检
+memory-kb2 index                      # 建索引
+memory-kb2 stats                      # 库有多大、倒排多少项、归档几张
+memory-kb2 search "候选池为什么"       # 命令行检索，看命中与分数
+memory-kb2 selfcheck                  # 本体体检
 ```
 
-也可以 `npm run index` / `npm run stats` / `npm run search -- "..."` / `npm run selfcheck`。
+**要指向你自己的笔记目录**，加一个环境变量即可：
 
-CLI 和 MCP 服务走同一条检索链路（两路召回 + RRF + 去重），区别只是 CLI 没有查询向量时会自动退回 BM25。
+```bash
+MEM_VAULT=~/notes memory-kb2 index
+```
+
+不设 `MEM_VAULT` 时按这个顺序找：`$DSH_HOME/memory-vault` → `~/.memory-vault`。
+两个都不存在时 `index` 会报错并提示路径——不会静默建一个空库。
 
 ### MCP 客户端：给 AI 用
+
+全局装过之后，配置只有三行：
 
 ```json
 {
   "mcpServers": {
     "memory_kb2": {
-      "command": "node",
-      "args": ["/absolute/path/to/memory-kb2/bin/memory-kb2.mjs", "serve"],
-      "env": { "MEM_VAULT": "/absolute/path/to/your/vault" }
+      "command": "memory-kb2",
+      "args": ["serve"],
+      "env": { "MEM_VAULT": "/你的/笔记目录" }
     }
   }
 }
 ```
 
-一个 MCP 进程绑一个库。要在同一会话里切多个库，就按库起多个实例。
+`env` 里那一行可以省略——省略时按上面的顺序自动找库。
+一个 MCP 进程绑一个库；要同时查多个库，就按库起多个实例（同一条命令，换 `MEM_VAULT`）。
 
 ---
 
