@@ -2,6 +2,8 @@
 
 MCP 记忆库：把本地 Markdown 卡片变成可检索的长期记忆。BM25 倒排 + 语义向量 + RRF 融合，不绑定客户端。
 
+**面向 Agent 的知识库，不是陪伴型长记忆。** 它记的是「这个项目为什么这么决定」「这个结论后来被推翻了」，不是聊天记录。所以它关心结论是否仍然成立（归档语义），也关心不同语料要用不同参数（三档 Profile）。
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg)](./package.json)
 [![Protocol](https://img.shields.io/badge/protocol-MCP-orange.svg)](https://modelcontextprotocol.io/)
@@ -40,6 +42,19 @@ MCP 记忆库：把本地 Markdown 卡片变成可检索的长期记忆。BM25 �
 - **检索**：Client → MCP server → Index（BM25 + 向量两路召回）→ RRF 融合 → 去重 → 返回
 - **索引**：vault（Markdown）→ indexer（切原子 + 分词）→ Index
 - **可选路径**：Embedding API 提供查询向量，Rerank API 做精排——两条都可关闭
+- **Profile 路由**：启动时按语料特征判一次，换库不用改配置
+
+### 三档 Profile
+
+| 档位 | 判定条件 | limit | 向量 | rerank | 实测 |
+|---|---|---:|---|---|---|
+| **engineering**（默认） | 其余 | 5 | 开 | 关 | 571 卡 59 题：top1 93.2% / top3 100%，p50 189 ms |
+| **wiki**（法学） | 平均标题 < 15 字 | 8 | 关 | 关 | 941 卡：BM25 MRR 0.529 > dense 0.434；概念名 recall@1 98.9% |
+| **chat**（已冻结） | 原子/卡 ≤ 3 且正文均长 < 800 字 | 14 | 开 | 开 | 5413 卡 · pool 80：命中 65% / 覆盖 0.588 |
+
+三档的差异不是拍脑袋定的：法学卡是概念名驱动的，标题即答案，密集向量的语义泛化反而引入近义干扰（dense 0.434 < BM25 0.529），所以 wiki 档关向量；聊天库要想起多轮细节，名额与召回宽度更关键，所以 limit 14 + 向量 + 重排全开。
+
+`chat` 档冻结，是因为 evidence 命中 48.3% 的天花板在**名额分配**而非检索链路——再调算法没有意义。冻结的含义与依据见 [docs/DEBUG-LOG.md](./docs/DEBUG-LOG.md) 第 20 轮。
 
 细节见 [docs/MECHANISM.md](./docs/MECHANISM.md)。
 
