@@ -93,6 +93,17 @@ const qvecCache = new Map()
 let qvecHits = 0
 let qvecMisses = 0
 
+// 检索结果缓存（2026-11-20）：查询向量缓存之后，整条检索链路剩下的本地开销还有约 50ms
+// （BM25 2.8 + 全表读 8 + 向量 topK 10 + RRF 33）。命中时直接返回上次组装好的文本。
+// 失效靠索引版本（meta.built_at）：重建索引 → built_at 变 → 旧条目再也命不中；
+// TTL 只是兜底，不承担正确性。默认开，MEM_RESULT_CACHE=0 关。
+const RCACHE_ON = process.env.MEM_RESULT_CACHE !== '0'
+const RCACHE_TTL_MS = Number(process.env.MEM_RESULT_CACHE_TTL) || 5 * 60 * 1000
+const RCACHE_MAX = Number(process.env.MEM_RESULT_CACHE_MAX) || 500
+const resultCache = new Map()
+let resultHits = 0
+let resultMisses = 0
+
 /** 含时间词的 query 不走缓存。 */
 const TIME_WORD = /今天|今晚|昨天|现在|当前|刚才|刚刚|本周|这周|本月|这个月|最近\s*\d|today|now|yesterday|current/i
 
@@ -420,6 +431,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const cacheLine = QVEC_CACHE_ON
       ? `查询向量缓存：命中 ${qvecHits} / 总计 ${cacheTotal}${cacheTotal ? `（${Math.round((qvecHits / cacheTotal) * 100)}%）` : ''}${qvecCache.size ? `，驻留 ${qvecCache.size} 条` : ''}`
       : '查询向量缓存：已关闭（MEM_QVEC_CACHE=0）'
+    const rcacheTotal = resultHits + resultMisses
+    const rcacheLine = RCACHE_ON
+      ? `结果缓存：命中 ${resultHits} / 总计 ${rcacheTotal}${rcacheTotal ? `（${Math.round((resultHits / rcacheTotal) * 100)}%）` : ''}${resultCache.size ? `，驻留 ${resultCache.size} 条` : ''}`
+      : '结果缓存：已关闭（MEM_RESULT_CACHE=0）'
     return {
       content: [{
         type: 'text',
@@ -430,6 +445,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           callLine,
           localLine,
           cacheLine,
+          rcacheLine,
           lastNote ? `最近降级：${lastNote}` : null,
           `索引新鲜度：${lastStale.stale ? `落后 ${Math.round(lastStale.lagMs / 60000)} 分钟（已触发同步）` : '最新'}`,
         ].filter(Boolean).join('\n'),
@@ -508,6 +524,24 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     const t0 = Date.now()
     const fresh = await ensureFresh()
+    // 索引版本：重建索引会让 built_at 变，旧缓存条目自然失效
+    let idxVersion = ''
+    try {
+      const d = new DatabaseSync(DB, { readOnly: true })
+      idxVersion = d.prepare("SELECT v FROM meta WHERE k='built_at'").get()?.v || ''
+      d.close()
+    } catch { /* 旧索引没有 meta 表时退化为「不缓存版本」 */ }
+    const rcacheKey = [q, (scope || []).join(','), limit, useRerank ? 1 : 0, includeDeleted ? 1 : 0, idxVersion].join('\u0001')
+    if (RCACHE_ON) {
+      const hit = resultCache.get(rcacheKey)
+      if (hit && Date.now() - hit.at < RCACHE_TTL_MS) {
+        resultHits += 1
+        resultCache.delete(rcacheKey); resultCache.set(rcacheKey, hit)   // LRU 提到末尾
+        const msCached = Date.now() - t0
+        return { content: [{ type: 'text', text: hit.text.replace(/，\d+ms/, `，${msCached}ms（结果缓存命中）`) }] }
+      }
+      resultMisses += 1
+    }
     let ranked = []
     let mode = ready
     lastNote = ''
@@ -621,12 +655,17 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       lastNote,
       archivedHint,
     ].filter(Boolean)
-    return {
+    const payload = {
       content: [{
         type: 'text',
         text: `检索到 ${out.length} 条（模式：${mode}｜${PROFILE.name}档·${QUERY_ROUTING ? (concept ? '概念名' : '描述性') : '统一'}·标题权×${titleW}，${ms}ms${notes.length ? '；' + notes.join('；') : ''}）：\n\n${lines.join('\n\n')}`,
       }],
     }
+    if (RCACHE_ON) {
+      resultCache.set(rcacheKey, { at: Date.now(), text: payload.content[0].text })
+      if (resultCache.size > RCACHE_MAX) resultCache.delete(resultCache.keys().next().value)
+    }
+    return payload
   }
 
   return { content: [{ type: 'text', text: `未知工具：${name}` }], isError: true }
