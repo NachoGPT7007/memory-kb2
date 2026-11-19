@@ -253,51 +253,70 @@ kb2 在 M01 / M02 上跑的是**自建评测**，指标是「evidence 命中率 
 
 ---
 
-## 11. PrecisionMemBench：检索精度实测 44.7%
+## 11. PrecisionMemBench：检索精度实测 13.2%
 
 [PrecisionMemBench](https://github.com/tenurehq/precisionmembench) 是**唯一的纯检索**记忆基准：不生成答案、不判分，只断言「每个 case 必须返回哪些记忆、必须不返回哪些」。噪声是硬失败。
 
-数据：35 个 belief（含别名、替代链、跨用户隔离样本）、77 个 case、13 类。只有 `relevantBeliefs` 这一层依赖检索系统，其余三层是本地推导。
+数据：35 个 belief（含别名、替代链、跨用户隔离样本）、77 个 case、13 类。`shouldOnlyInclude: []` 的 32 个 case 表示**只应返回空**——返回任何 belief 都算失败。
 
 接入方式：把 belief 建成卡（`_id` 作文件名便于映射），用 kb2 检索 top10，按断言判分。脚本：[`bench/eval-precision.mjs`](../bench/eval-precision.mjs)。
 
 ### 结果
 
-**34 / 76 = 44.7%**
+**10 / 76 = 13.2%**
 
-| 分类 | 通过 | 说明 |
-|---|---:|---|
-| Alias resolution | 3/23 | **最大短板**：`k8s` → `b-kubernetes-entity` 这类别名映射基本没命中 |
-| Scope disambiguation | 7/12 | 返回了不同 scope 的卡（`domain:code` vs `domain:writing`） |
-| Fuzzy matching | 3/7 | 前缀与近似匹配不足 |
-| Type routing and open questions | 5/6 | 较好 |
-| Design boundary cases | 5/6 | 较好 |
-| Budget eviction and capacity | 3/5 | 名额分配有改进空间 |
-| Persona prelude content | 4/4 | 本地层，与检索无关 |
-| Relation expansion | 0/4 | 未实现关系扩展 |
-| Supersession chain exclusion | 3/3 | 替代链排除正确 |
-| Ranking stability | 0/2 | 排序稳定性不足 |
-| Counter-signal retrieval | 0/2 | 反信号（不该提旧事）未处理 |
-| Cross-user isolation | 0/1 | **未实现 user_id 隔离** |
-| Cold start behavior | 1/1 | — |
+**这个数字要与官方基线一起看**（同一基准、封存集、各系统官方提交）：
 
-### 这 44.7% 说明什么
+| 系统 | 通过率 | active retrieval 通过 |
+|---|---:|---:|
+| Qwen3（向量） | 14.3% | 1 / 77 |
+| Nomic（向量） | 14.3% | 1 / 77 |
+| **Hindsight（商业）** | 14.3% | 0 / 77 |
+| **Mem0（商业）** | 11.7% | 0 / 77 |
+| Cognee | 11.7% | 0 / 77 |
+| **memory-kb2** | **13.2%** | 见下 |
 
-**不是因为检索算法差，是因为三个功能没做**：
+**这个基准对几乎所有系统都是 12–14%。** 原因不是系统都差，是断言极严：32 个 case 要求「返回空」，而任何检索系统默认都会返回 top-k。
 
-1. **没有 scope 过滤**——belief 自带 `scope: [domain:code]`，kb2 检索时不看这个字段，于是把写作域的卡也捞出来，撞上 `shouldOnlyInclude` 断言
-2. **没有 user_id 隔离**——数据里有专门构造的跨用户泄露样本（`b-other-user-leak-check`），kb2 的卡没有用户维度，必然违规
-3. **别名解析弱**——`k8s`/`kube` 到 `kubernetes` 的映射靠 BM25 的字符重叠，中文二元组的做法对英文缩写不适用
+### 分类明细
 
-前两条是**明确的功能缺口**，不是调参能解决的；第三条是分词策略的边界（当前二元组分词为中文设计）。
+| 分类 | 通过 |
+|---|---:|
+| Alias resolution | 2/23 |
+| Scope disambiguation | 0/12 |
+| Fuzzy matching | 3/7 |
+| Type routing | 0/6 |
+| Design boundary | 2/6 |
+| Budget eviction | 1/5 |
+| Relation expansion | 0/4 |
+| Supersession chain | 0/3 |
+| Ranking stability | 0/2 |
+| Counter-signal | 0/2 |
+| Cross-user isolation | 0/1 |
+
+### 这 13.2% 说明什么
+
+**kb2 与官方基线持平，但没有超过它们。** 三个具体短板：
+
+1. **没有 scope 过滤**——belief 自带 `scope: [domain:code]`，kb2 不看这个字段，把写作域的卡也捞出来
+2. **没有 user_id 隔离**——数据里有跨用户泄露样本，kb2 的卡没有用户维度
+3. **别名解析弱**——`k8s`/`kube` → `kubernetes` 靠字符重叠，而二元组分词为中文设计
+
+前两条是数据结构缺口，第三条是分词策略边界。
+
+### 判分口径的重要说明（曾出错一次）
+
+初版判分把 `shouldOnlyInclude: []` 当作「无断言」跳过了，得出 **44.7%**。那 32 个 case 因此变成白送分。修正后是 **13.2%**。
+
+这个错误值得记下来：**「空断言」不等于「没有断言」，它是最强的那条断言**——要求你什么都不返回。
 
 ### 与另外两个基准的关系
 
 | 基准 | 测什么 | kb2 结果 | 口径 |
 |---|---|---|---|
-| PrecisionMemBench | **纯检索精度**（断言式） | 34/76 = 44.7% | 检索系统的输出，不含生成 |
+| PrecisionMemBench | **纯检索精度**（断言式） | 10/76 = 13.2% | 检索输出，不含生成；官方基线同为 12–14% |
 | chat-memory-benchmark 2.2 | 端到端（检索 + 答题 + 判分） | M01 ≈35 / M02 ≈39 | 全程接入，官方 harness |
 | 自建工程库标注 | 精确找卡 | top1 93.2% / top3 100% | 59 条，短标题语料 |
 
-三个数字不能互相换算。44.7% 是**最严格**的那个——它要求“只返回该返回的”，多一条都算失败。
+三个数字不能互相换算。13.2% 的绝对值低，但它与所有公开基线持平——**这个基准衡量的是「克制」，不是「找得到」**：能返回相关记忆很容易，知道什么时候不该返回很难。
 

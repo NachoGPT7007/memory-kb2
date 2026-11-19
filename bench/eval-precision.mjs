@@ -77,11 +77,17 @@ for (const c of cases) {
 
   let ok = true
   const reasons = []
-  if (Array.isArray(expect.shouldOnlyInclude) && expect.shouldOnlyInclude.length > 0) {
-    const extra = got.filter((id) => !expect.shouldOnlyInclude.includes(id))
-    if (extra.length > 0) { ok = false; reasons.push(`多返回 ${extra.join(',')}`) }
-    const missing = expect.shouldOnlyInclude.filter((id) => !gotSet.has(id))
-    if (missing.length > 0) { ok = false; reasons.push(`漏返回 ${missing.join(',')}`) }
+  if (Array.isArray(expect.shouldOnlyInclude)) {
+    if (expect.shouldOnlyInclude.length === 0) {
+      // 基准语义：shouldOnlyInclude = [] 表示「只应返回空」。
+      // 返回任何 belief 都是失败——这一条此前被跳过，导致通过率虚高。
+      if (got.length > 0) { ok = false; reasons.push(`应返回空，实际返回 ${got.length} 条`) }
+    } else {
+      const extra = got.filter((id) => !expect.shouldOnlyInclude.includes(id))
+      if (extra.length > 0) { ok = false; reasons.push(`多返回 ${extra.join(',')}`) }
+      const missing = expect.shouldOnlyInclude.filter((id) => !gotSet.has(id))
+      if (missing.length > 0) { ok = false; reasons.push(`漏返回 ${missing.join(',')}`) }
+    }
   }
   if (Array.isArray(expect.mustExclude)) {
     const bad = expect.mustExclude.filter((id) => gotSet.has(id))
