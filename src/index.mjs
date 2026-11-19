@@ -55,8 +55,21 @@ const TITLE_ROUTE_MIN_COV = Number(process.env.MEM_TITLE_ROUTE_MIN_COV || 0.3)
 // ---- 分词 ----------------------------------------------------------------
 // 正文里「答案型」小节：这些段落的检索价值高于叙述性正文。
 // 2026-11-08 加：原先只索引 frontmatter 的 atoms，正文 88% 的内容检索不到（覆盖率 11.7%）。
-const BODY_SECTIONS = /^(排障|要点|结论|教训|根因|现象|原因|解决|修复|验证|注意|背景|方案|对比|步骤)/
-const BODY_MIN = 30, BODY_MAX = 400
+// 正文「答案型」小节的词表。工程/聊天语域是默认值；法学卡的章节名是
+// 体系位置 / 内容 / 类型·情形 / 效果 / 例外与争议 / 连线 / 溯源 / 待核实，
+// 一条都不匹配默认词表 —— 这就是法学库 385 万字正文零入索引的根因（2026-11-20 实测：
+// 941 卡只有 941 条 title 原子 + 7527 条 frontmatter 原子，b-/p- 前缀为 0）。
+// MEM_BODY_SECTIONS 逗号分隔，按库注入；不设则保持原词表，行为不变。
+const BODY_SECTIONS_RAW = (process.env.MEM_BODY_SECTIONS || '').trim()
+const BODY_SECTIONS = BODY_SECTIONS_RAW
+  ? new RegExp(`^(${BODY_SECTIONS_RAW.split(/[,，]/).map((x) => x.trim()).filter(Boolean).join('|')})`)
+  : /^(排障|要点|结论|教训|根因|现象|原因|解决|修复|验证|注意|背景|方案|对比|步骤)/
+const BODY_MIN = 30
+const BODY_MAX = Number(process.env.MEM_BODY_MAX) || 400
+// 法学卡的 [[物债二分]] 链接：17037 个链接名若原样入索引，会变成大量以链接名为 token 的
+// 噪声（同一概念在每张卡里出现一次，idf 被压扁）。入索引前剥括号、保留锚文本。
+const STRIP_WIKILINKS = process.env.MEM_STRIP_WIKILINKS !== '0'
+const stripLinks = (t) => (STRIP_WIKILINKS ? t.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, a, b) => b || a) : t)
 
 const STOP = new Set('的了是我在和有就都而及与着不也这那其等或从把被让给对为以中上下个人一'.split(''))
 const CJK = /[\u4e00-\u9fff]/
@@ -199,7 +212,7 @@ export async function build() {
         const h = /^#{2,3}\s+(.+)$/.exec(line.trim())
         if (h) { inTarget = BODY_SECTIONS.test(h[1].trim()); continue }
         if (!inTarget) continue
-        const seg = line.trim()
+        const seg = stripLinks(line.trim())
         if (seg.length < BODY_MIN || seg.length > BODY_MAX) continue
         const bid = 'b-' + crypto.createHash('sha1').update(rel + '|' + seg).digest('hex').slice(0, 10)
         insAtom.run(bid, cid, seg, 'body', 'body', 1, '', 0.6, seg.length)
@@ -213,7 +226,7 @@ export async function build() {
     if (!card.atoms.length && nBodyAtom === 0) {
       const bodyRaw = text.split(/^---$/m).slice(2).join('')
       for (const para of bodyRaw.split(/\n\s*\n/)) {
-        const seg = para.replace(/^#{1,6}\s+.*$/gm, ' ').replace(/\s+/g, ' ').trim()
+        const seg = stripLinks(para.replace(/^#{1,6}\s+.*$/gm, ' ').replace(/\s+/g, ' ').trim())
         if (seg.length < BODY_MIN || seg.length > BODY_MAX) continue
         const bid = 'p-' + crypto.createHash('sha1').update(rel + '|' + seg).digest('hex').slice(0, 10)
         insAtom.run(bid, cid, seg, 'body', 'body', 1, '', 0.6, seg.length)
