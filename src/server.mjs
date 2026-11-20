@@ -673,6 +673,21 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
     const bmQ = expandAliases(q)
+    // 弱匹配判断（2026-11-20）：用 query 向量与全库原子的最大余弦，而不是 token 覆盖率。
+    // 词法信号在中文上会被 bigram 碎片化骗过——实测「zzz不存在的查询xyz」的 token 覆盖率
+    // 0.71、idf 加权后仍有 0.606，比 2 条真实题还高；向量不受影响：
+    // 64 条真实题 min 0.705 / p10 0.742，5 条无关查询 max 0.523，间隔 0.18，阈值取 0.60。
+    let weakMatch = null
+    if (qvec) {
+      try {
+        const vec = idx.loadVectors()
+        if (vec) {
+          const [top] = idx.vectorTopK(qvec, vec, 1)
+          const thr = Number(process.env.MEM_WEAK_COS) || 0.6
+          if (top && Number(top.score) < thr) weakMatch = Number(top.score)
+        }
+      } catch { /* 向量不可用时不提示，行为与改动前一致 */ }
+    }
     if (qvec && vectorOn) {
       // 融合顺序与 limit 无关（内部两路各取 200 再 RRF），取满 fetchN 让后续去重有牌可打
       const r = idx.hybridQuery(q, { limit: fetchN, qvec, titleW, includeDeleted, bm25Query: bmQ, scope })
@@ -785,6 +800,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     // 返回结果最主要的那个目录下、没进结果的最近几张卡，告诉 Agent「这里还有东西可看」。
     // 只给标题不给内容，避免撑上下文；要读用 memory_get。
     const notes = [
+      weakMatch != null ? `弱匹配：最相近的卡语义相似度只有 ${weakMatch.toFixed(3)}（本库正常查询 ≥0.70），库里可能没有真正相关的内容，以下结果仅供排除` : '',
       fresh.stale ? `索引落后 ${Math.round(fresh.lagMs / 60000)} 分钟、已触发后台同步，新内容可能还查不到` : '',
       lastNote,
       archivedHint,
