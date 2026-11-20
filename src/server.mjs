@@ -409,6 +409,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'memory_map',
+      description:
+        '记忆库地图：按目录列出卡片标题与路径，让你在检索前知道「库里到底有什么」。'
+        + '没有明确关键词、或任务面较宽时先看地图，再决定用 memory_search 查什么。'
+        + '超出字符预算的部分会截断并提示，可用 dir 收窄（模仿 aider 的 repo map：先给全库符号，再按需读取）。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          dir: { type: 'string', description: '只看某个顶层目录，如 02-Projects（可选）' },
+          budget: { type: 'number', description: '返回文本的字符预算，默认 8000（约 5k token），上限 40000' },
+          include_deleted: { type: 'boolean', description: '是否包含已归档卡，默认否' },
+        },
+      },
+    },
+    {
+      name: 'memory_get',
+      description:
+        '按路径读取整张卡（frontmatter + 全部正文）。memory_search 只返回命中片段；'
+        + '当你要看完整内容、或需基于这张卡和别的卡做综合判断时用它（对应 aider 的「按需请求具体文件」）。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '卡片相对路径，memory_search / memory_map 返回的那个' },
+        },
+        required: ['path'],
+      },
+    },
+    {
       name: 'memory_stats',
       description: '查看记忆索引状态（卡片数、原子数、向量化与重排模型、API 状态与最近失败原因）。',
       inputSchema: { type: 'object', properties: {} },
@@ -418,6 +446,57 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params
+
+  if (name === 'memory_map') {
+    const dir = String(args.dir || '').trim().replace(/^\/+|\/+$/g, '')
+    const budget = Math.min(Math.max(Number(args.budget) || 8000, 1000), 40000)
+    const includeDeleted = args.include_deleted === true
+    const db = new DatabaseSync(DB, { readOnly: true })
+    const rows = db.prepare(
+      `SELECT path, title, COALESCE(status,'') AS status, mtime FROM cards
+       ${dir ? 'WHERE path LIKE ?' : ''} ORDER BY path`,
+    ).all(...(dir ? [dir + '/%'] : []))
+    db.close()
+    const kept = rows.filter((r) => includeDeleted || String(r.status) !== 'deleted')
+    const byDir = new Map()
+    for (const r of kept) {
+      const top = String(r.path || '').split('/')[0] || '(root)'
+      if (!byDir.has(top)) byDir.set(top, [])
+      byDir.get(top).push(r)
+    }
+    let out = `# 记忆库地图（${kept.length} 张卡${dir ? `，仅 ${dir}` : ''}）\n`
+    let used = out.length, shown = 0, dropped = 0
+    for (const [top, list] of [...byDir.entries()].sort((a, b) => b[1].length - a[1].length)) {
+      const head = `\n## ${top}（${list.length}）\n`
+      if (used + head.length > budget) { dropped += list.length; continue }
+      out += head; used += head.length
+      for (const r of list.sort((a, b) => (b.mtime || 0) - (a.mtime || 0))) {
+        const day = r.mtime ? new Date(r.mtime).toISOString().slice(0, 10) : ''
+        const line = `- ${r.title} ｜ ${r.path}${day ? ` ｜ ${day}` : ''}\n`
+        if (used + line.length > budget) { dropped++; continue }
+        out += line; used += line.length; shown++
+      }
+    }
+    if (dropped) out += `\n…预算已用尽，还有 ${dropped} 张未列出。用 dir 收窄，或调大 budget。\n`
+    return { content: [{ type: 'text', text: out }] }
+  }
+
+  if (name === 'memory_get') {
+    const rel = String(args.path || '').trim().replace(/^\/+/, '')
+    if (!rel) return { content: [{ type: 'text', text: '缺 path 参数' }], isError: true }
+    const root = path.resolve(VAULT)
+    const abs = path.resolve(root, rel)
+    // 防路径穿越：只允许读 vault 内的文件
+    if (abs !== root && !abs.startsWith(root + path.sep)) {
+      return { content: [{ type: 'text', text: '拒绝：path 必须位于 vault 内' }], isError: true }
+    }
+    try {
+      const text = await fsp.readFile(abs, 'utf8')
+      return { content: [{ type: 'text', text }] }
+    } catch {
+      return { content: [{ type: 'text', text: `读取失败：${rel} 不存在或不可读` }], isError: true }
+    }
+  }
 
   if (name === 'memory_stats') {
     const db = new DatabaseSync(DB, { readOnly: true })

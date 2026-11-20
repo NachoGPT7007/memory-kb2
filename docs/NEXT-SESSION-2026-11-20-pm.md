@@ -120,6 +120,32 @@ ctx.on('session/event', (session, event) => {
 | 插件写入 | **未验证**——需重启 dsh web 让修复后的代码真正加载 |
 | 装配备份 | `profiles/web/{package.json,cordis.patch.yml}.bak-20261120-pre-memory-kb2` |
 
+### 3.1 记忆库探索原语（2026-11-20 新增，本轮已实测）
+
+参照两个蓝本补齐「Agent 如何探索记忆库」：
+
+- **Aider 的 repo map**（https://aider.chat/docs/repomap.html）：给 LLM 全库符号地图
+  （tree-sitter 提取 → 文件依赖图 → 图排序 → 在 `--map-tokens`（默认 1k）预算内选最重要的部分），
+  LLM 看完地图再**按需索取具体文件**。
+- **RAGFlow 1.0**：Agentic Retrieval（分析问题 → 必要时分解 → 检索 → 验证证据）+ 引用溯源。
+
+kb2 此前只有 `memory_search`（黑盒检索），Agent 不知道库里有 571 张卡、也打不开检索到的卡。
+新增两个只读工具：
+
+| 工具 | 作用 | 实测 |
+|---|---|---|
+| `memory_map` | 按目录列出全部卡标题+路径+日期，带字符预算（默认 8000，上限 40000），超限截断并提示用 `dir` 收窄 | `dir=02-Projects` → 88 张卡 / 2021 字符，截断正常 |
+| `memory_get` | 按 path 读整张卡（frontmatter + 全文），带路径穿越防护 | 读到 1718 字符完整卡；`../../etc/passwd` 被拒 |
+
+**MVP 的边界**：`search`（精准）+ `map`（有什么）+ `get`（读全卡）+ 摄入（对话沉淀）
+构成一个闭环。以下**不属于 MVP**，但蓝本里有、后续要补：
+
+- Agentic 多步检索（分解问题、多轮检索、验证证据）
+- 反馈闭环（哪张卡被用上了 → 影响排序）
+- 知识编译（Wiki / Graph / Timeline 等结构化产物）
+- 上下文组装（一次返回多卡 + 关系标注，而不是零散片段）
+
+
 ## 4. 下一步
 
 1. 重启 `dsh-lab-web` → 验证：本轮结束后 `vault` 是否新增卡（此前 10 天 0 张）
