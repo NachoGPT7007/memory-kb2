@@ -15,7 +15,7 @@
 `~/memory-kb2/src/server.mjs`（675 行），但**上次重启时撞上 vault 路径 bug**，
 已在 `038ef0c` 修复：
 
-- 旧版把 vault 硬编码成 `/home/nachogpt/.dsh-web-lab/memory-vault`
+- 旧版把 vault 硬编码成 `~/.dsh-web-lab/memory-vault`
 - 仓库版默认 `~/.memory-vault`（不存在）→ `memory_stats` 报 `unable to open database file`
 - 修法：`MEM_VAULT` → `DSH_HOME/memory-vault` → `~/.memory-vault` 三级解析；
   装配侧同时给主实例补了 `env.MEM_VAULT`
@@ -103,9 +103,9 @@ bigram 当卖点（Lucene CJKAnalyzer 也是 bigram）。
 
 | 项 | 值 |
 |---|---|
-| 仓库 | `/home/nachogpt/memory-kb2`（HEAD `85c5687`） |
-| 生产 vault | `/home/nachogpt/.dsh-web-lab/memory-vault`（571 卡 / 5958 原子） |
-| 法学库 | `/home/nachogpt/WikiConstruct/vault`（941 卡 / 8468 原子） |
+| 仓库 | `~/memory-kb2`（HEAD `85c5687`） |
+| 生产 vault | `~/.dsh-web-lab/memory-vault`（571 卡 / 5958 原子） |
+| 法学库 | `~/WikiConstruct/vault`（941 卡 / 8468 原子） |
 | MCP 装配 | `~/.dsh-web-lab/profiles/web/cordis.patch.yml`（两个实例都指向仓库版） |
 | 装配备份 | `cordis.patch.yml.bak-20261120-033720-pre-kb2new` |
 | 旧版 server | `~/dsh-armory/mcp/memory-server.mjs`（未动，回滚用） |

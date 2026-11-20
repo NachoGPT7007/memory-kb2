@@ -9,7 +9,7 @@
 
 ## 项目状态（已核实，不用重查）
 
-仓库：/home/nachogpt/memory-kb2（已开源，HEAD 在 a059321 之后）
+仓库：~/memory-kb2（已开源，HEAD 在 a059321 之后）
 文档：docs/{ORIGIN,MECHANISM,TUNING,BENCHMARK,DEBUG-LOG,GAP,HANDOFF}.md
 
 已验证的基线（不要推翻，除非有更强证据）：
