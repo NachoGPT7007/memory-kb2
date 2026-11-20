@@ -145,6 +145,27 @@ kb2 此前只有 `memory_search`（黑盒检索），Agent 不知道库里有 57
 - 知识编译（Wiki / Graph / Timeline 等结构化产物）
 - 上下文组装（一次返回多卡 + 关系标注，而不是零散片段）
 
+### 3.2 上下文组装 + 分步检索（2026-11-20 本轮，全部复用既有组件）
+
+原则：能复用就复用，不新建索引、不新建存储。
+
+| 改动 | 复用的是什么 |
+|---|---|
+| `memory_search` 每卡返回「路径 + 更新日期 + 状态 + 结论段（180 字）」 | 已有的 `cards.mtime/status` 与命中原子（`hitAtoms`），一次批量 SQL，不改排序 |
+| 末尾给「同目录还有未返回的卡，例如 …——要读全文用 memory_get」 | 已有的 `cards` 表 + `path LIKE` 查询，作为分步检索的下一跳线索 |
+| `memory_get` 每次读取落一行账本 | **复用已有的 `memory-recall-ledger.jsonl`**（原供 `scripts/memory-recall-stats.mjs` 做区域加权），新增 `action: "get"` 区分 |
+
+状态只在「非正常」时显示（`deleted`/`rejected`/`pending`）；`active`/`approved` 是常态，不占位置。
+
+**这就是「分步检索」在 MCP 里的形态**：Agent 自己转循环（查 → 判断够不够 → 再查），
+server 的职责是让每一转都有信息量（可判断的材料 + 下一跳线索 + 能读全卡）。
+不是 server 内部调 LLM 做多轮。
+
+实测（生产库）：`search("vault 路径解析", limit=2)` 返回两张卡带结论段与日期，
+并提示「同目录（03-Knowledge）还有未返回的卡，例如 …——要读全文用 memory_get」；
+`memory_get` 后账本新增 `{"action":"get","path":"…"}`。
+
+
 
 ## 4. 下一步
 

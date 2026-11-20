@@ -492,6 +492,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     try {
       const text = await fsp.readFile(abs, 'utf8')
+      // 反馈闭环最小版本：复用既有召回账本，get 也落一行（action 区分），
+      // 后续可用 scripts/memory-recall-stats.mjs 统计「哪些卡被真正读过」。
+      await logRecall({ ts: new Date().toISOString(), action: 'get', path: rel })
       return { content: [{ type: 'text', text }] }
     } catch {
       return { content: [{ type: 'text', text: `读取失败：${rel} 不存在或不可读` }], isError: true }
@@ -700,6 +703,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       })),
     })
     if (!out.length) return { content: [{ type: 'text', text: `记忆库中没有与「${q}」相关的内容。` }] }
+    // 卡片元数据（mtime / status）：Agent 要判断「这张是不是我要的那张、还作不作数」，
+    // 只给标题和一行片段不够。一次 SQL 批量取，不增加往返、不改排序。
+    const cardMeta = new Map()
+    try {
+      const dbm = new DatabaseSync(DB, { readOnly: true })
+      const phm = out.map(() => '?').join(',')
+      for (const r of dbm.prepare(`SELECT path, mtime, COALESCE(status,'') AS status FROM cards WHERE path IN (${phm})`).all(...out.map((h) => h.path))) cardMeta.set(r.path, r)
+      dbm.close()
+    } catch { /* 元数据取不到不影响检索结果 */ }
     const lines = out.map((h, i) => {
       const score = h.score != null ? ` [${Number(h.score).toFixed(3)}]` : ''
       // 命中段落优先展示正文答案段（nature=body），没有才退回 frontmatter 原子。
@@ -707,11 +719,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const hits = h.hitAtoms || []
       const bodyHits = hits.filter((a) => a.nature === 'body').map((a) => a.text)
       const factHits = hits.filter((a) => a.nature !== 'body').map((a) => a.text)
-      const show = (bodyHits.length ? bodyHits : factHits).slice(0, 3)
+      const show = (bodyHits.length ? bodyHits : factHits).slice(0, 2)
       const hitLine = show.length
-        ? `\n命中${bodyHits.length ? '（正文）' : ''}：${show.map((t) => t.slice(0, 120)).join(' ／ ')}`
-        : `\n${(h.text || '').slice(0, 160)}`
-      return `### ${i + 1}. ${h.title}${score}\n路径：${h.path}${hitLine}`
+        ? `\n结论：${show.map((t) => t.slice(0, 180)).join(' ／ ')}`
+        : `\n结论：${(h.text || '').slice(0, 180)}`
+      const m = cardMeta.get(h.path)
+      const day = m?.mtime ? new Date(m.mtime).toISOString().slice(0, 10) : ''
+      // 只在「非正常」状态时才标出来（deleted/rejected/pending），active/approved 是常态、不占位置
+      const st = m?.status && !['active', 'approved'].includes(m.status) ? ` ｜ 状态：${m.status}` : ''
+      return `### ${i + 1}. ${h.title}${score}\n路径：${h.path}${day ? ` ｜ 更新：${day}` : ''}${st}${hitLine}`
     })
     // 归档卡提示（2026-11-14）：库里有 14.9% 的卡 status: deleted（结论已不再成立），默认不返回。
     // 用户查历史时「什么都搜不到」会以为记忆丢了，而卡其实在库里。只在名额没满时提一句，
@@ -734,11 +750,30 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
       } catch { /* 提示失败不影响结果 */ }
     }
+    // 分步检索的下一跳提示（复用 cards 表，不新建索引）：
+    // 返回结果最主要的那个目录下、没进结果的最近几张卡，告诉 Agent「这里还有东西可看」。
+    // 只给标题不给内容，避免撑上下文；要读用 memory_get。
     const notes = [
       fresh.stale ? `索引落后 ${Math.round(fresh.lagMs / 60000)} 分钟、已触发后台同步，新内容可能还查不到` : '',
       lastNote,
       archivedHint,
     ].filter(Boolean)
+    // 分步检索的下一跳提示（复用 cards 表，不新建索引）：
+    // 返回结果最主要的那个目录下、没进结果的最近几张卡，告诉 Agent「这里还有东西可看」。
+    // 只给标题不给内容，避免撑上下文；要读用 memory_get。
+    try {
+      const topDir = (out[0]?.path || '').split('/')[0]
+      if (topDir) {
+        const got = new Set(out.map((h) => h.path))
+        const dbn = new DatabaseSync(DB, { readOnly: true })
+        const rows = dbn.prepare(
+          "SELECT title, path FROM cards WHERE path LIKE ? AND COALESCE(status,'') != 'deleted' ORDER BY mtime DESC LIMIT 12",
+        ).all(topDir + '/%')
+        dbn.close()
+        const extra = rows.filter((r) => !got.has(r.path)).slice(0, 3)
+        if (extra.length) notes.push(`同目录（${topDir}）还有未返回的卡，例如：${extra.map((r) => r.title).join('、')}——要读全文用 memory_get`)
+      }
+    } catch { /* 提示失败不影响检索结果 */ }
     const payload = {
       content: [{
         type: 'text',
