@@ -1,8 +1,8 @@
 # memory-kb2
 
-MCP 记忆库：把本地 Markdown 卡片变成可检索的长期记忆。BM25 倒排 + 语义向量 + RRF 融合，不绑定客户端。
+把本地 Markdown 卡片变成可探索、可检索、可维护的 Agent 知识库。核心检索采用 BM25 倒排、可选语义向量与 RRF 融合，通过 MCP 或 CLI 使用，不绑定某个 AI 客户端。
 
-**面向 Agent 的知识库，不是陪伴型长记忆。** 它记的是「这个项目为什么这么决定」「这个结论后来被推翻了」，不是聊天记录。所以它关心结论是否仍然成立（归档语义），也关心不同语料要用不同参数（三档 Profile）。
+**面向 Agent 的知识库，不是陪伴型聊天记忆。** 它保存的是「这个项目为什么这样决定」「哪个结论已经失效」「那次故障怎样修复」，而不是把整段聊天记录重新塞回上下文。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg)](./package.json)
@@ -13,178 +13,203 @@ MCP 记忆库：把本地 Markdown 卡片变成可检索的长期记忆。BM25 �
 
 ## Why
 
-会话结束，上下文就没了。你上周讨论过的方案、踩过的坑、做过的决定，下次开新会话时它一个字都不记得。
+会话结束后，模型不会自然带走项目背景。把全部历史写进 system prompt 又会在卡片增多后失效：上下文变长，真正相关的结论反而被淹没。
 
-把记忆塞进 system prompt 能撑一阵，但几百张卡之后就撑不住了——不是超长，就是淹没了真正相关的那几条。检索是唯一的出路。
+kb2 将记忆分成两层：
 
-而检索的坑比想象中深。这个项目在 20 轮控制变量实验里，有五次得出「某个组件没用」的结论，其中**四次最后追溯到观测手段的问题**：查询取自卡正文、送进重排的是 40 字碎片、候选池只有 20、零成本模拟替代真实实现。这些过程全部留在 [DEBUG-LOG.md](./docs/DEBUG-LOG.md) 里，包括被推翻的结论。
+- **Markdown 卡片是真源**：人和 Agent 都能阅读、修改、版本管理。
+- **索引只是可重建的派生物**：SQLite 倒排与可选向量服务于检索，可以随时从卡片重建。
 
-起点更具体一点：[ORIGIN.md](./docs/ORIGIN.md) 记录了它为什么被做出来——以及一个库说「标题权重越大越差」、另一个库说「×3 最好」时，怎么判断谁对。
+它也不只提供一个「黑盒搜索框」。`memory_map` 让 Agent 先知道库里有什么，`memory_search` 定位候选，`memory_get` 读取完整卡片，`memory_update` 修正过时结论，`memory_stats` 检查运行状态。这五件事构成一个最小但完整的知识库工作流。
+
+项目的设计与参数来自多轮控制变量实验，包括被推翻的结论。为什么某些看似合理的优化最终没有采用，见 [ORIGIN](./docs/ORIGIN.md)、[DEBUG-LOG](./docs/DEBUG-LOG.md) 和 [EXPERIMENT-2026-11-20](./docs/EXPERIMENT-2026-11-20.md)。
 
 ---
 
 ## Features
 
-- **混合检索**：BM25（`node:sqlite` 内建）+ 向量召回 → RRF 融合 → 内容去重
-- **零外部检索依赖**：BM25 走 Node 内建 SQLite；向量与重排可选，无凭据自动退回 BM25-only
-- **场景档位自动识别**：启动时按语料特征判一次（wiki / chat / engineering），不用手工切环境变量
-- **自适应候选池**：`clamp(1.09·√cards, 20, 80)`，池深随库规模走
-- **归档卡片语义**：`status: deleted` 的结论默认不返回，查历史决策时显式打开
-- **可证伪的自检**：`selfcheck.mjs` 检查索引自洽、归档规模、候选池不变量、延迟构成、服务层准确率
-- **不绑定客户端**：任何支持 MCP 的客户端都能连
+### 检索与排序
+
+- **混合检索**：自建 SQLite BM25 倒排 + 可选向量召回，使用 RRF 按名次融合，避免直接比较两种不同尺度的分数。
+- **原子级索引**：标题、frontmatter atoms、答案型正文小节分别入库；没有匹配小节的卡片按段落兜底，`kind: code` 卡片则整卡入库。
+- **三档 Profile**：启动时根据语料统计量选择 `engineering` / `wiki` / `chat` 参数；能力仍在同一套引擎中，Profile 只负责调参。
+- **自适应候选池**：默认 `clamp(round(1.09 × √cards), 20, 80)`，也可用环境变量覆盖。
+- **归档与作用域**：默认排除 `status: deleted`；调用方可显式传入 `scope`，BM25 与向量两路都会过滤。
+- **可选精排**：支持远端 rerank，默认是否开启由 Profile 与显式参数决定，不把重排成本强加给所有查询。
+
+### Agent 工作流
+
+- **五个 MCP 工具**：搜索、全库地图、整卡读取、卡片更新、状态检查。
+- **可分步探索**：搜索结果带路径、更新日期、异常状态、命中结论和同目录下一跳提示；Agent 可以自行继续 `map → search → get`，不需要服务端内部再调用一个 LLM。
+- **弱匹配提示**：向量可用时，以查询与全库原子的最大余弦相似度识别低相关内容；只提示，不伪造「绝对无结果」，也不改变排序。
+- **读取反馈**：`memory_get` 的真实读取记录会给后续检索一个默认很弱的对数加成；`MEM_FEEDBACK_BOOST=0` 可关闭。
+- **索引新鲜度检查**：检索前检查卡片 mtime 与同步标记，发现落后时后台触发同步，不阻塞当前查询。
+
+### 运行与维护
+
+- **零必需外部检索服务**：BM25 使用 Node.js 内置 `node:sqlite`；没有模型凭据时可走 BM25-only。
+- **两级缓存**：查询向量 LRU/TTL 缓存 + 带索引版本的结果缓存；重建索引后旧结果自然失效。
+- **同步策略分工**：SQLite 全量重建，向量只补缺失原子；模型变化时重新编码，避免不同模型向量错位拼接。
+- **可检查而非凭感觉**：`selfcheck` 检查索引完整性、归档规模、候选池不变量、延迟构成，并可在副本上跑服务层评测。
+- **部署边界简单**：一个 MCP 进程绑定一个 vault；多库通过多个实例隔离。
 
 ---
 
 ## Architecture
 
-[![memory-kb2 architecture](./docs/assets/architecture.png)](./docs/assets/architecture.png)
+下图按当前源码重绘。实线表示基础链路，虚线表示可选模型能力或按需触发的同步链路。
 
-检索与索引是两条链路，共用一份索引：
+```mermaid
+flowchart TB
+  subgraph ENTRY["入口层"]
+    MCP["MCP Client<br/>AI Agent"]
+    CLI["CLI<br/>人直接管理"]
+  end
 
-- **两个入口**：MCP Client（给 AI 用，经 stdio 服务）与 CLI（给人用，直接读写索引）
-- **检索**：入口 → Index（BM25 + 向量两路召回）→ RRF 融合 → 去重 → 返回
-- **索引**：vault（Markdown）→ indexer（切原子 + 分词）→ Index
-- **可选路径**：Embedding API 提供查询向量，Rerank API 做精排——两条都可关闭
-- **Profile 路由**：启动时按语料特征判一次，换库不用改配置
+  subgraph SERVICE["服务层 · src/server.mjs"]
+    TOOLS["五个 MCP 工具<br/>search · map · get · update · stats"]
+    GUARD["Profile · 两级缓存 · 新鲜度检查<br/>弱匹配提示 · 上下文组装"]
+  end
 
+  subgraph CORE["索引与检索内核 · src/index.mjs"]
+    INDEXER["Markdown 解析<br/>原子化 · 分词 · BM25 倒排"]
+    RETRIEVAL["BM25 + 可选向量召回<br/>RRF · scope · 归档过滤"]
+  end
+
+  SYNC["同步器<br/>vendor/embed/sync-index.mjs"]
+  VAULT[("Vault<br/>Markdown 真源")]
+  SQLITE[("SQLite<br/>cards · atoms · postings")]
+  VECTORS[("向量文件<br/>vectors.f32 / vectors.json")]
+  API["Embedding / Rerank API<br/>可选"]
+
+  MCP --> TOOLS --> GUARD --> RETRIEVAL
+  CLI --> INDEXER
+  CLI --> RETRIEVAL
+  VAULT --> INDEXER --> SQLITE --> RETRIEVAL
+  TOOLS -->|"map / stats"| SQLITE
+  TOOLS -->|"get / update"| VAULT
+  GUARD -.->|"索引落后时后台触发"| SYNC
+  SYNC --> INDEXER
+  SYNC -.->|"只补缺失向量"| API
+  API -.-> VECTORS
+  VECTORS -.-> RETRIEVAL
+  RETRIEVAL -.->|"可选精排"| API
+```
+
+关键边界：**卡片不是 SQLite 的缓存，SQLite 才是卡片的派生索引。** `memory_update` 修改的是 Markdown；后续同步再更新索引。`memory_map` 与 `memory_get` 是只读工具，只有 `memory_update` 会修改卡片。
 
 ### 数据流：从卡片到结果
 
 ```mermaid
 flowchart TB
-  subgraph IDX["索引链路 · 离线"]
-    direction LR
-    V["vault<br/>*.md 卡片"] --> A["切原子<br/>小节标题优先 + 30–400 字窗"]
-    A --> T["分词<br/>中文二元组 + 停用词"]
-    T --> B["BM25 打分<br/>k1=1.2 · b=0.75 · titleW=3.0"]
-    A -.-> E["向量化<br/>批量编码 · 可选"]
-    B --> S[("SQLite<br/>倒排 + 元数据")]
-    E -.-> W[("vectors.f32<br/>原子向量")]
+  subgraph WRITE["索引链路"]
+    V["Vault 中的 *.md"] --> P["解析 frontmatter + 正文"]
+    P --> A["生成原子<br/>title / atoms / 答案型小节 / 兜底段落"]
+    A --> C{"kind: code ?"}
+    C -->|"是"| W["整卡作为一个检索单元"]
+    C -->|"否"| N["保留卡片原子切分"]
+    W --> T["统一分词<br/>中文 bigram + ASCII 整词"]
+    N --> T
+    T --> S[("SQLite<br/>倒排 + 元数据 + scope")]
+    A -.->|"可选"| E["Embedding<br/>只编码缺失原子"]
+    E -.-> F[("vectors.f32<br/>+ vectors.json")]
   end
 
-  subgraph QRY["检索链路 · 在线"]
-    direction LR
-    Q["query"] --> QT["查询分词<br/>同一套二元组"]
-    QT --> BM["BM25 召回<br/>pool 条"]
-    Q -.-> QE["查询向量化<br/>约 166 ms"]
-    QE -.-> VR["向量召回<br/>cosine topK"]
-    W -.-> VR
-    BM --> RRF["RRF 融合<br/>score = Σ 1/(60 + rank)"]
+  subgraph READ["检索链路"]
+    Q["memory_search(query)"] --> FRESH["ensureFresh<br/>检查索引新鲜度"]
+    FRESH --> RC{"结果缓存命中？"}
+    RC -->|"是"| OUT0["直接返回<br/>缓存键含索引 built_at"]
+    RC -->|"否"| PARAM["合并 Profile 与显式参数<br/>limit · scope · rerank · include_deleted"]
+    PARAM --> BM["BM25 召回"]
+    PARAM -.->|"向量开启"| QE["查询向量化<br/>LRU + TTL；时间词跳过此缓存"]
+    S --> BM
+    QE -.-> VR["向量召回"]
+    F -.-> VR
+    BM --> RRF["RRF 融合 · k=60<br/>两路均执行 scope / 归档过滤"]
     VR -.-> RRF
-    RRF --> POST["去重 + 归档过滤<br/>原子级 · status: deleted"]
-    POST --> RE["重排<br/>可选 · 默认关"]
-    POST --> LIM["limit 截断"]
-    RE -.-> LIM
-    LIM --> RES["返回结果"]
+    RRF --> DD["内容去重 + limit 截断"]
+    RRF -.->|"显式或 Profile 开启"| RR["Rerank<br/>标题 + 正文摘要"]
+    RR -.-> DD
+    DD --> FB["真实读取反馈<br/>对数弱加成，可关闭"]
+    FB --> CTX["组装结果<br/>路径 · 日期 · 状态 · 命中结论"]
+    CTX --> NOTE["附加提示<br/>弱匹配 · 归档候选 · 同目录下一跳"]
+    NOTE --> OUT1["返回结果<br/>写召回账本并更新结果缓存"]
   end
-
-  S -.->|同一份索引| BM
 ```
 
-实线是默认路径，虚线是可选路径（向量与重排都有凭据才启用）。
+几个容易误解的实现细节：
 
-每一步的参数与实测依据：
+1. **去重和 `limit` 截断发生在融合之后**，避免重复副本提前耗尽名额。
+2. **读取反馈是弱加成，不是另一条检索路**，只应影响分数接近的卡片。
+3. **弱匹配提示依赖向量**；没有向量时保持原有行为，不使用中文 token 覆盖率硬猜相关性。
+4. **查询向量缓存与结果缓存不是同一层**：前者省去远端 embedding，后者省去整条本地检索与组装链路。
+5. **CLI `index` 只构建 SQLite**；向量文件由同步器生成。仅运行 `index` 不会自动得到向量索引。
 
-| 步骤 | 参数 | 依据 |
+机制与参数依据分别见 [MECHANISM](./docs/MECHANISM.md) 和 [TUNING](./docs/TUNING.md)。个别早期文档中的链路描述若与当前源码不同，以源码和最新实验记录为准。
+
+---
+
+## MCP tools
+
+| 工具 | 主要参数 | 用途 |
 |---|---|---|
-| 切原子 | 30–400 字窗口，小节标题优先 | 更碎则噪声大，更长则语义分散 |
-| 分词 | 中文二元组 + 停用词 | 零词典依赖；59 条标注 top1 93.2% |
-| BM25 | k1=1.2 / b=0.75 | 实测 0.2–0.75 区间排序不变，用默认值 |
-| 标题权重 | titleW=3.0 | 与 1.3 在 59 条上打平，概念名查询略优 |
-| 候选池 | clamp(1.09·√cards, 20, 80) | 571 卡→26，5413 卡→80（两个拟合点） |
-| RRF | k=60 | 常数，排名融合不依赖分数尺度 |
-| 去重 | 正文前 160 字指纹 | 真实库存在完整副本，去重后 top5 唯一内容 3.60→5.00 |
-| 归档过滤 | 原子级 active 标志 | 卡级过滤会漏掉「部分结论已归档」 |
-| 重排 | 输入必须是完整 chunk | 喂 40 字原子碎片会让结论反转 17pp（第 16 轮） |
+| `memory_search` | `query`、`limit`、`rerank`、`deep`、`include_deleted`、`scope` | 检索候选卡，返回分数、路径、日期、状态、命中结论和后续探索提示 |
+| `memory_map` | `dir`、`budget`、`include_deleted` | 按目录列出卡片标题、路径和日期；超出字符预算时明确截断 |
+| `memory_get` | `path` | 读取整张卡；限制路径必须位于 vault 内，并记录一次真实读取反馈 |
+| `memory_update` | `path`、`text`、`close_atom` | 追加带日期的修正记录，或将指定 atom 标记为失效 |
+| `memory_stats` | 无 | 查看卡数、原子数、模型/API 状态、缓存命中率、降级原因和索引新鲜度 |
 
-### 三档 Profile
-
-| 档位 | 判定条件 | limit | 向量 | rerank | 实测 |
-|---|---|---:|---|---|---|
-| **engineering**（默认） | 其余 | 5 | 开 | 关 | 571 卡 59 题：top1 93.2% / top3 100%，p50 189 ms |
-| **wiki**（法学） | 平均标题 < 15 字 | 8 | 关 | 关 | 941 卡：BM25 MRR 0.529 > dense 0.434；概念名 recall@1 98.9% |
-| **chat**（已冻结） | 原子/卡 ≤ 3 且正文均长 < 800 字 | 14 | 开 | 开 | 5413 卡 · pool 80：命中 65% / 覆盖 0.588 |
-
-三档的差异不是拍脑袋定的：法学卡是概念名驱动的，标题即答案，密集向量的语义泛化反而引入近义干扰（dense 0.434 < BM25 0.529），所以 wiki 档关向量；聊天库要想起多轮细节，名额与召回宽度更关键，所以 limit 14 + 向量 + 重排全开。
-
-`chat` 档冻结，是因为 evidence 命中 48.3% 的天花板在**名额分配**而非检索链路——再调算法没有意义。冻结的含义与依据见 [docs/DEBUG-LOG.md](./docs/DEBUG-LOG.md) 第 20 轮。
-
-细节见 [docs/MECHANISM.md](./docs/MECHANISM.md)。
+`scope` 是**检索过滤条件，不是权限系统**。它不会自动从 cwd 或问题文本推断，也不提供用户认证、租户隔离或加密。
 
 ---
 
 ## Quick start
 
-### 安装
+### 1. 安装
+
+要求 **Node.js ≥ 22**，因为索引层使用内置 `node:sqlite`。
 
 ```bash
-npm install -g memory-kb2        # 需要 Node ≥ 22
+npm install -g memory-kb2    # 当前 latest 为 0.4.3，CLI bin 已实测可运行
 ```
 
-想跟最新提交或改代码，用仓库：
+从仓库运行：
 
 ```bash
-git clone https://github.com/NachoGPT7007/memory-kb2 && cd memory-kb2 && npm install
+git clone https://github.com/NachoGPT7007/memory-kb2.git
+cd memory-kb2
+npm install
 ```
 
-Node 22 起才有内置的 `node:sqlite`——这是「零外部检索依赖」的前提，版本不够直接装不上。
+### 2. 准备 vault
 
-### 第一次用：还没有 vault
-
-`MEM_VAULT` 指向的目录就是库。**它不会替你挑内容**：没有卡片就没有记忆可检索，索引再新也是空的。
+`MEM_VAULT` 指向存放 Markdown 卡片的目录。没有卡片时，检索引擎只能返回空库结果，不会替你生成知识。
 
 ```bash
-mkdir -p ~/notes          # 1. 准备目录，放 2–3 个 .md 卡片
-MEM_VAULT=~/notes memory-kb2 index                 # 2. 建索引
-MEM_VAULT=~/notes memory-kb2 search "某个结论"      # 3. 确认查得出来
+mkdir -p ~/notes
+export MEM_VAULT="$HOME/notes"
+memory-kb2 index
+memory-kb2 stats
+memory-kb2 search "某个结论"
 ```
 
-一张卡最少是这样——`title` 加上回答型小节（`结论` / `要点` / `根因` 等标题下的正文才进索引）：
+一张最小卡片可以这样写：
 
 ```markdown
 ---
 title: 检索融合为什么用 RRF
 status: active
+scope: [domain:engineering]
 ---
 
 ## 结论
 
-BM25 分数没有上界，向量相似度在 [0,1]，两路不可比。排名是唯一共同的度量。
+BM25 分数没有固定上界，向量相似度与它的分数尺度不同。RRF 使用各路排名进行融合，因此不要求两路原始分数可直接比较。
 ```
 
-两张现成的卡在 [`examples/minimal-vault`](./examples/minimal-vault)，可以直接照抄结构。
+正文行需满足当前切分长度约束才会成为正文原子；生产卡片也可以使用 frontmatter `atoms`。完整示例见 [`examples/minimal-vault`](./examples/minimal-vault)。
 
-**空库的两种表现不一样，别混**（2026-11-20 实测）：
-
-| 入口 | 行为 |
-|---|---|
-| `memory-kb2 index` 指向不存在的目录 | **exit 0**，建出 0 卡 / 0 原子的空索引；之后 `search` 全部无命中，但**不报错** |
-| MCP `memory_stats` / `memory_search`，索引文件不存在 | 工具错误 `unable to open database file` |
-
-所以「查不到东西」先看 `memory-kb2 stats` 的卡片数：0 卡是没放卡，不是检索坏了。
-
-### 命令行：给人用
-
-```bash
-memory-kb2 index                      # 建索引
-memory-kb2 stats                      # 库有多大、倒排多少项、归档几张
-memory-kb2 search "候选池为什么"       # 命令行检索，看命中与分数
-memory-kb2 selfcheck                  # 本体体检
-```
-
-**要指向你自己的笔记目录**，加一个环境变量即可：
-
-```bash
-MEM_VAULT=~/notes memory-kb2 index
-```
-
-不设 `MEM_VAULT` 时**两个入口的查找顺序不同**：MCP 服务按 `$DSH_HOME/memory-vault` → `~/.memory-vault` 依次找；
-CLI（`index` / `search` / `stats`）只认 `MEM_VAULT` 或 `~/.memory-vault`，不看 `DSH_HOME`。
-要避免这种歧义，就显式写 `MEM_VAULT`。
-
-### MCP 客户端：给 AI 用
-
-全局装过之后，配置只有三行：
+### 3. 接入 MCP 客户端
 
 ```json
 {
@@ -192,169 +217,220 @@ CLI（`index` / `search` / `stats`）只认 `MEM_VAULT` 或 `~/.memory-vault`，
     "memory_kb2": {
       "command": "memory-kb2",
       "args": ["serve"],
-      "env": { "MEM_VAULT": "/你的/笔记目录" }
+      "env": {
+        "MEM_VAULT": "/absolute/path/to/your/vault"
+      }
     }
   }
 }
 ```
 
-`env` 里那一行建议写上——省略时 MCP 服务按 `$DSH_HOME/memory-vault` → `~/.memory-vault` 找。
-一个 MCP 进程绑一个库；要同时查多个库，就按库起多个实例（同一条命令，换 `MEM_VAULT`）。
+**建议始终显式设置 `MEM_VAULT`。** 当前 CLI 与 MCP 的默认查找顺序并不完全相同：
+
+| 入口 | 未设置 `MEM_VAULT` 时 |
+|---|---|
+| CLI | 使用 `~/.memory-vault` |
+| MCP 服务 | 优先使用已存在的 `$DSH_HOME/memory-vault`，否则使用 `~/.memory-vault` |
+
+一个进程只绑定一个库。需要多个库时，启动多个 MCP 实例，分别设置不同的 `MEM_VAULT`。
+
+### 4. 可选：启用向量与重排
+
+设置 `ALI_API_KEY` 或 `DASHSCOPE_API_KEY`。模型与维度可通过 `EMBED_API_MODEL`、`RERANK_API_MODEL`、`EMBED_API_DIM` 覆盖。
+
+在仓库中手动同步 SQLite 与向量：
+
+```bash
+MEM_VAULT=/absolute/path/to/your/vault node vendor/embed/sync-index.mjs
+```
+
+同步器会重建 SQLite，只编码缺失向量。MCP 服务检测到 vault 变更时也会在后台调用它；请确保同步器与服务使用同一个 `MEM_VAULT`。
+
+没有凭据时可以显式关闭模型路径：
+
+```bash
+MEM_VECTOR=0 MEM_RERANK=0 memory-kb2 serve
+```
+
+### 5. 自检
+
+```bash
+memory-kb2 selfcheck
+```
+
+`--serve` 会启动真实 MCP 往返并可能触发索引同步，**只对 vault 副本使用**；私有标注题集不随公开仓库提供，因此陌生环境不能复现全部历史准确率数字。
 
 ---
 
-## 不适合用它做什么
+## Profiles
 
-这份清单来自实验记录，不是免责声明——每一条都有对应的失败数字或未实现的环节：
+| Profile | 自动判定条件 | 默认 limit | 向量 | rerank | 适用语料 |
+|---|---|---:|---|---|---|
+| `wiki` | 平均标题长度 < 15 字 | 8 | 关 | 关 | 概念名驱动、标题本身高度承载答案的卡片 |
+| `chat` | 非 title 原子/卡 ≤ 3，且 body 原子均长 < 800 字 | 14 | 开 | 开 | 多轮对话沉淀；该档检索调参已冻结，不代表问题已解决 |
+| `engineering` | 其余 | 5 | 开 | 关 | 项目决策、排障记录、技术知识卡 |
 
-| 场景 | 为什么不适合 | 证据 |
-|---|---|---|
-| 长文档问答 / 全文检索 | 输入单位是卡片切成的小节原子，不是 PDF 或长文。要查长文，得先把结论写成卡 | 正文只收「结论 / 要点 / 根因」这类回答型小节，叙述性正文不进索引 |
-| 代码检索 | 中文二元组分词对代码结构无效，别拿它替代 grep | CodeRAG-Bench RepoEval：nDCG@10 **88.0**，Lucene BM25 **93.2**（输 5.2） |
-| 需要多段 evidence 拼答案 | 一题一段时 top1 93.2%；一题要多段拼接时，证据覆盖率中位数只有 0.50 | chat-memory-benchmark 2.2 实测 A 39.2，低于基线 45.1 |
-| 多用户 / 并发写 | 一个 vault 一个 SQLite 文件，写入靠整体重建索引；没有权限模型、没有租户隔离 | 未实现 |
-| 自动沉淀记忆 | 不会自己从对话里抽卡。只有 `memory_update` 让人显式追加修正或标记失效 | 未实现 |
-| 图文 / 多模态 | 只索引文本 | 未实现 |
+显式环境变量优先于自动档位。常用项：
 
-**它擅长的是**一题一段的精准召回——查一个配置、一条决策、一次排障记录、一个概念的定义。
-这类查询上工程库 top1 93.2% / top3 100%，法学概念名 recall@1 98.9%。
+| 环境变量 | 作用 |
+|---|---|
+| `MEM_VECTOR` | `0` 关向量，`1` 强制开；未设置时由 Profile 决定 |
+| `MEM_RERANK` | `0` 关重排，`1` 开；单次调用的 `rerank` 参数也可覆盖 |
+| `MEM_DEFAULT_LIMIT` | 覆盖默认返回条数，服务层仍限制在 1–20 |
+| `MEM_TITLE_W` | 覆盖标题权重；服务层默认统一使用 3.0 |
+| `MEM_POOL` / `MEM_POOL_MIN` / `MEM_POOL_MAX` | 固定候选池，或调整自适应上下限 |
+| `MEM_BODY_SECTIONS` | 注入答案型小节标题词表，适配法学等非工程语料 |
+| `MEM_BODY_MAX` | 调整正文原子长度上限，默认 400 |
+| `MEM_STRIP_WIKILINKS` | 默认剥离 `[[wikilink]]` 括号、保留锚文本；设 `0` 关闭 |
+| `MEM_ALIAS` | 设 `1` 开启确定性别名扩展；默认关，只作用 BM25 路 |
+| `MEM_QVEC_CACHE` / `MEM_RESULT_CACHE` | 分别关闭查询向量缓存 / 结果缓存：设为 `0` |
+| `MEM_WEAK_COS` | 调整弱匹配余弦阈值，默认 0.60 |
+| `MEM_FEEDBACK_BOOST` / `MEM_FEEDBACK_ALPHA` | 关闭读取反馈，或调整弱加成系数 |
+
+换库时最需要重新检查的不是 BM25 的 `k1` / `b`，而是**正文小节词表、标题权重、候选池与返回名额**。具体证据见 [TUNING](./docs/TUNING.md)。
 
 ---
 
 ## Measured
 
-工程库 571 卡、59 条人工标注查询：
+以下数字是特定语料、特定配置下的历史实测，不是对任意 vault 的保证。不同基准的指标与任务口径不能直接横向换算。
 
-| 配置 | top1 | top3 |
-|---|---:|---:|
-| 纯 BM25 | **93.2%** | **100%** |
-| + 向量 RRF | 92% | 100% |
+| 场景 | 样本与配置 | 结果 |
+|---|---|---|
+| 工程知识库 | 571 卡，59 条有效人工标注 | BM25 top1 **93.2%**；混合检索 top3 **100%** |
+| 法学概念卡 | 约 941 卡 | 概念名 recall@1 约 **98.8–98.9%** |
+| 法学正文细节 | 注入领域小节词表、正文入索引 | top1 **87.7% → 97.6%**；概念名指标基本持平 |
+| CodeRAG-Bench RepoEval | 6 仓库、373 查询，函数转卡及对应实验配置 | nDCG@10 **93.2**，打平论文 BM25 基线，不是超过 |
+| PrecisionMemBench | 76 条断言，BM25 路 | 基线 **13.2%**；显式 scope **23.7%**；scope + alias **26.3%** |
+| 查询向量缓存 | 64 条工程查询，同进程配对 | 命中 p50 **54 ms**，净省约 **191 ms** |
+| 检索结果缓存 | 同上，重复查询 | 第二次 p50 **55 ms → 1 ms**，返回序列 64/64 一致 |
 
-延迟 p50 189 ms / p95 225 ms，其中 166 ms（88%）是一次远端 embedding 往返。
+负面结果同样保留：chat-memory-benchmark 2.2 的本地 M01 / M02 成绩低于所用基线；工程库上的高 top1 不能外推成陪伴型长记忆能力。本项目没有向公开榜提交成绩，私有评测卡片与标注集也不随仓库发布。
 
-完整数据集、指标定义与全部实验数字见 [docs/BENCHMARK.md](./docs/BENCHMARK.md)。
-
-**本项目没有向公开榜提交过成绩。** PrecisionMemBench（纯检索断言基准）实测 10/76 = 13.2%——与官方基线（Qwen3 14.3%、Hindsight 14.3%、Mem0 11.7%）持平——详见 [BENCHMARK 第 11 节](./docs/BENCHMARK.md)。 与 chat-memory-benchmark 1.0 / 2.2 的关系、以及为什么自测数字不能直接和榜上 A 分比较，写在 [BENCHMARK 第 10 节](./docs/BENCHMARK.md)——那一节也列出了聊天域偏弱、只在两个合成人物上测过这些坏消息。
-
----
-
-## 换库要重标参数
-
-下面的默认值是从三个真实库（工程 571 卡 / 法学 wiki 941 卡 / 聊天 5413 卡）调出来的，不是普适最优。
-换一份语料，这几项最先失效：
-
-| 参数 | 默认 | 覆盖方式 | 为哪类语料调的 |
-|---|---|---|---|
-| `titleW` | 3.0（档位）/ 1.3（库函数兜底） | `MEM_TITLE_W` | 标题即答案的概念卡。概念名查询 1.0→2.0：工程 93.0%→99.6%、法学 80.1%→95.9%；描述性查询相反，3.0 时 −3.4pp |
-| `pool` | `clamp(1.09·√cards, 20, 80)` | `MEM_POOL` / `MEM_POOL_MIN` / `MEM_POOL_MAX` | 拟合点只有两个（571→26、5413→80）。卡数落在中间地带时，这条曲线没有实测支撑 |
-| 档位阈值 | 标题均长 15 字 · 原子/卡 3 · 正文均长 800 字 | 不自动，用显式环境变量压过档位 | 三个库的分界；第四个库落在哪一档，没验证过 |
-| 正文小节词表 | `排障 / 要点 / 结论 / 根因 …` | `MEM_BODY_SECTIONS` | 默认词表是工程与聊天语域。法学卡章节名（体系位置 / 内容 / 效果 / 例外与争议）一条都不匹配，385 万字正文因此零入索引——**换领域必查这一项** |
-
-**重标顺序别反过来：**
-
-1. 看现状：卡片数用 `memory-kb2 stats`；**判成哪一档只有 MCP `memory_search` 的返回头会打印**（形如 `engineering档·标题权×3`），CLI 不显示档位
-2. 自己标 **50 条以上**查询——低于 50 条不下结论，这是本项目的硬规则（15 条时看到的 +7pp，扩到 59 条变成打平）
-3. 跑一次基线 top1 / top3，再**一次只动一个参数**
-4. 只保留方向一致、幅度超过噪声的改动
-
-不重标不一定会坏。坏的是出了问题你分不清是参数、语料，还是卡本身写得不行。
+完整口径、失败案例和实验边界见 [BENCHMARK](./docs/BENCHMARK.md) 与 [EXPERIMENT-2026-11-20](./docs/EXPERIMENT-2026-11-20.md)。
 
 ---
 
-## Docs
+## 适合与不适合
 
-| 文档 | 内容 |
+**适合：** 一题一段的精准召回，例如查一个配置、一条项目决策、一次排障记录、一个概念定义；再由 Agent 按需读取整卡并综合判断。
+
+| 场景 | 当前边界 |
 |---|---|
-| [HANDOFF](./docs/HANDOFF.md) | 交接与实验计划：三刀的变量、对照组、判定标准、回滚点 |
-| [GAP](./docs/GAP.md) | 与企业级 RAG 的逐环节对比：14 个环节里缺了哪些，为什么端到端打不过 |
-| [ORIGIN](./docs/ORIGIN.md) | 为什么做、怎么变成现在这样。含 title 权重 1.0/1.3/3.0 的两次校准与架构之争 |
-| [MECHANISM](./docs/MECHANISM.md) | 卡片与原子、索引构建、检索链路、RRF、候选池、档位判定、一致性保障 |
-| [TUNING](./docs/TUNING.md) | 每个参数的取值依据，含**被证伪的参数**与已知未解五项 |
-| [BENCHMARK](./docs/BENCHMARK.md) | 数据集与指标、全部实测数字、延迟分解、可证伪的候选池不变量 |
-| [DEBUG-LOG](./docs/DEBUG-LOG.md) | 20 轮调试全过程，保留全部被推翻的结论 |
+| 长文档 / PDF 问答 | 输入单位是 Markdown 卡片，不是通用文档解析器；需要先整理成卡 |
+| 陪伴型聊天记忆 | 可以检索对话沉淀卡，但多段证据拼接与长期细节覆盖仍是弱项 |
+| 代码检索 | `kind: code` 已修复函数被切碎的问题，并在 RepoEval 打平 BM25 基线；但它仍不是源码索引器，也不能替代 grep / 代码专用 RAG |
+| 多用户服务 | 没有认证、权限模型和租户隔离；scope 只是过滤，不是安全边界 |
+| 高并发写入 | SQLite 索引采用整体重建，向量做增量补齐；不是多写者数据库 |
+| 自动沉淀对话 | 本仓库提供检索与显式 `memory_update`，不负责从对话自动抽取卡片；DSH 侧沉淀属于独立集成层 |
+| 服务端自主多跳推理 | 当前提供分步探索原语，但问题分解、多轮验证由调用方 Agent 完成 |
+| 图文与多模态 | 只索引文本 |
+
+---
+
+## 与 DSH 的关系
+
+kb2 的检索引擎和 MCP 服务不依赖 DSH，任何支持 MCP stdio 的客户端都可以使用。
+
+DSH 生态中的 `dsh-armory/packages/dsh-memory-kb2` 是独立集成层，负责宿主装配与会话沉淀等能力；它不改变本仓库的检索内核。**本仓库本身不会监听会话，也不会自动把聊天内容写进 vault。**
+
+集成层的演进与本次核对结果：
+
+| 时间 / 提交 | 状态 |
+|---|---|
+| 2026-11-02 `1afa954` | 从 memory-eternal fork 出 kb2 集成层，改为写 v2 卡并指向新检索链路 |
+| 2026-11-02 `44a80b7` | 增加 `memory_update` 工具，允许追加修正或关闭失效原子 |
+| 2026-11-08 `59c53be` | 整包临时下线 |
+| 2026-11-20 `ec4825c` | 恢复插件；把失效的 `agent/turn-stopping` 监听改为 `session/event` 的 `turn/end`，并放宽 peer 依赖 |
+| 2026-11-20 `05c4604` | 改为任务级沉淀：连续空闲 `captureIdleMs`（默认 5 分钟）后处理整段任务；一次产出 0–3 张卡 |
+
+截至本次重写，集成层已有一张 `submittedBy: deepseek-harness` 的沉淀卡在生产 vault 落盘，说明写入链路已端到端通过。该卡的内容与沉淀质量仍属于个人数据，不在本 README 中展开。
+
+---
+
+## Status and roadmap
+
+### 已落地
+
+- 混合检索、三档 Profile、自适应候选池、归档过滤与内容去重
+- `map / search / get / update / stats` 五个 MCP 工具
+- 显式 scope、可选别名扩展、法学正文词表注入
+- 查询向量缓存、索引版本感知的结果缓存
+- 弱匹配提示、同目录下一跳、真实读取反馈弱加成
+- SQLite 全量重建 + 向量增量同步
+- `kind: code` 整卡入库与统一 CLI
+
+### 仍需证据或实现
+
+| 方向 | 当前缺口 |
+|---|---|
+| scope 自动推断 | 当前只支持调用方显式传入；自动推断的准确率未验证 |
+| 多段证据覆盖 | 聊天与复杂问答需要的不只是单卡 top1，名额分配仍未解决 |
+| Agentic 多步检索 | 已有 map/get/下一跳原语，服务端不负责问题分解与证据验证 |
+| 冷热分层参与排序 | 真实读取反馈已落地，但完整冷热分层策略与可信样本仍不足 |
+| 跨语料参数泛化 | 候选池公式与 Profile 阈值来自有限真实库，第四类语料需要重新标定 |
+
+多跳扩散、查询级路由、默认开启 rerank、BM25F 等方向曾因实测无效或收益不足被否决；不要因为它们「看起来合理」就重复加入。详见 [ORIGIN](./docs/ORIGIN.md)。
 
 ---
 
 ## Project layout
 
-```
+```text
 memory-kb2/
+├── bin/
+│   └── memory-kb2.mjs          统一 CLI：index / search / stats / selfcheck / serve
 ├── src/
-│   ├── server.mjs        MCP 服务：memory_search / memory_update / memory_stats
-│   ├── index.mjs         索引器：切原子、分词、BM25 倒排、可选向量
-│   └── embed-api.mjs     Embedding / Rerank 的 HTTP 适配层
+│   ├── server.mjs              MCP 工具、Profile、缓存、同步触发、结果组装
+│   ├── index.mjs               卡片解析、原子化、BM25、向量召回、RRF
+│   ├── embed-api.mjs           Embedding / Rerank HTTP 适配与错误状态
+│   └── alias-table.json        可选确定性别名表
 ├── scripts/
-│   └── selfcheck.mjs     本体体检：索引自洽、候选池不变量、延迟构成、准确率
-├── docs/                 机制、调参、基准、调试史
-└── examples/             最小的 vault 示例
+│   ├── memory-index.mjs        索引内核兼容入口
+│   └── selfcheck.mjs           索引、候选池、延迟与服务层检查
+├── vendor/embed/
+│   └── sync-index.mjs          SQLite 重建与缺失向量同步
+├── bench/                      评测方法；私有数据不发布
+├── examples/minimal-vault/     最小卡片示例
+└── docs/                       机制、调参、基准、实验史与交接记录
 ```
 
----
+## Docs
 
-## 状态与路线
-
-### 已经到顶的
-
-| 能力 | 指标 | 判断依据 |
-|---|---|---|
-| 工程库精确检索 | top1 93.2% / top3 100%（59 条） | 剩余失败题为标注串模糊 |
-| 法学 wiki 概念名 | recall@1 98.9%（940 卡） | 标题即答案，加权已饱和 |
-| 延迟 | p50 189 ms | 其中 166 ms 是 embedding 往返，属结构性，调参无解 |
-
-### 有证据的待办
-
-| 事项 | 已有信号 | 缺什么 |
-|---|---|---|
-| 重叠聚类按簇分配名额 | 模拟中覆盖 +35~43% | 未落地到生产 |
-| 时间维度（到点/今天到期类） | 自然榜 X4 类召回为 0 | 未验证；且卡片 mtime、frontmatter、正文时间三者常不一致，先要定用哪个 |
-| 法学库原子数不一致 | 首次 15718、后续 8468，两次数字对不上 | 缺可重复的最小样本 |
-| 正文未进索引 | 已知：wiki 卡片正文不参与检索 | 属设计待定，改了会影响 wiki 档 |
-
-### 边界：做了一半或数据不足的
-
-| 事项 | 现状 | 缺什么 |
-|---|---|---|
-| **冷热分层**（hot / warm / cold / dead） | 已在 `selfcheck` 里实现：按召回账本算四层比例与标记漂移。**但它只做统计，没有参与检索**——hot 卡不会因为「热」而排前 | 分层要进检索，先得有可信的账本。当前账本只有 13 次检索，cold/dead 判定不可信（检查项自己会报这条） |
-| **反向关联 / 二次检索** | 会话记录里未找到完整实验数据，无法给出结论 | 需要重新定义「什么算关联」并跑一次基线 |
-
-### 已否决，不再列入路线
-
-| 方向 | 否决依据 |
+| 文档 | 内容 |
 |---|---|
-| **多跳检索** | 桥接精度 1–3%（跳出去 610 条只有 18 条是答案依据）；工程库 top3 已 100%，只有下降风险。详见 [DEBUG-LOG](./docs/DEBUG-LOG.md) 第 20 轮 |
-| 查询级路由 | 59 条上 90% vs 统一 92%，持续证伪 |
-| BM25F 字段加权 | 模拟 +17.5pp，实现 −21.7pp |
-| 多角度 BM25（句法切分） | 命中 50.0% → 50.0%，切出的片段与原句共享同一批 bigram |
-| rerank 默认开 | 修正评测输入后与无重排打平（90% vs 92%），多付 0.8 秒 |
-| 外置向量库 | **无实测依据**。此前写在这里是推测：万卡级规模从未出现过，`vectors.f32` 全量加载的实际内存占用没有测过 |
-
-完整的功能账本（保留 9 项 / 撤掉 13 项及原因）见 [ORIGIN 第 3 节](./docs/ORIGIN.md)。
+| [MECHANISM](./docs/MECHANISM.md) | 卡片、原子、索引、召回、RRF、Profile 与一致性 |
+| [TUNING](./docs/TUNING.md) | 参数默认值、实测依据与已证伪方向 |
+| [BENCHMARK](./docs/BENCHMARK.md) | 指标口径、基准结果与不可横比的原因 |
+| [EXPERIMENT-2026-11-20](./docs/EXPERIMENT-2026-11-20.md) | 缓存、scope、别名、法学正文等单变量实验 |
+| [ORIGIN](./docs/ORIGIN.md) | 设计决策账本：为什么保留、修正或撤掉某项能力 |
+| [DEBUG-LOG](./docs/DEBUG-LOG.md) | 调试全过程，包括错误结论及其根因 |
+| [GAP](./docs/GAP.md) | 与更完整 RAG / Agent 记忆系统的差距 |
+| [HANDOFF](./docs/HANDOFF.md) | 实验纪律、阶段状态与后续验证事项 |
 
 ## Contributing
 
-Issue 用于讨论，PR 欢迎但按现状维护、不承诺跟进节奏。提交前请跑 `npm run selfcheck`。
+Issue 用于讨论，PR 欢迎。修改检索行为前请先写清变量、对照组、样本量、判定标准与回滚点；一次只改一个变量。提交前至少运行：
+
+```bash
+npm run selfcheck
+```
+
+不要把私有卡片、真实查询标题、凭据或本机绝对路径提交到公开仓库。
 
 ---
 
 ## 设计来源
 
-- **[memory-eternal](https://github.com/EternalNight996/dsh-memory-eternal)**（EternalNight996，MIT）
-  本项目的前身。vault 的卡片结构、以及「对话结束自动沉淀成卡」的思路来自它。
-  kb2 在它之上重写了检索链路：BM25 倒排 + 向量召回 + RRF 融合 + 三档 Profile。
-- **[chat-memory-benchmark](https://github.com/Ornn8/chat-memory-benchmark)**（Ornn8）
-  聊天域题库 M01 / M02 的来源。它是面向**陪伴型** AI 的中文记忆基准，
-  而 kb2 是 Agent 知识库——借它的题库只用于测「长对话里的细节召回」这一项能力，
-  不在于定位相同。哪一档因此冻结，见 [DEBUG-LOG 第 20 轮](./docs/DEBUG-LOG.md)。
-- **[Archify](https://github.com/tt-a1i/archify)**（tt-a1i，`@tt-a1i/archify-dsh`）
-  本 README 架构图的绘制工具。
-- **RRF** —— Cormack、Clarke、Büttcher，SIGIR 2009。
+- **[memory-eternal](https://github.com/EternalNight996/dsh-memory-eternal)**：前身。vault 卡片结构与对话沉淀思路来自它；kb2 重写了检索与探索链路。
+- **[chat-memory-benchmark](https://github.com/Ornn8/chat-memory-benchmark)**：聊天域题库来源。借用它测试长对话细节召回，不代表项目定位相同。
+- **[Archify](https://github.com/tt-a1i/archify)**：旧版 PNG 架构图的绘制工具；当前 README 图表改为可维护的 Mermaid。
+- **RRF**：Cormack、Clarke、Büttcher，SIGIR 2009。
 
-依赖见 `package.json`，不在此列。
-
----
+依赖见 [`package.json`](./package.json)。
 
 ## License
 
-MIT。详见 [LICENSE](./LICENSE)。
+MIT，详见 [LICENSE](./LICENSE)。
 
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
