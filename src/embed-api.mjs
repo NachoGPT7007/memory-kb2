@@ -8,6 +8,14 @@
  *   2) 失败可见：记录最近一次调用的状态码与原因，供 memory_stats 直接显示。
  *   3) 单次超时 + 一次重试：网络抖动不应把整条检索链路打挂。
  *
+ * 超时（2026-11-21 改）：查询路径的默认超时 30s → 5s。
+ *   依据：Resurface core/recall.py 的三层时间预算（查询向量 3s、补算 2s 内最多 8 条）；
+ *   本脚本实测 embedding 往返 166–261ms（见 docs/NEXT-SESSION-2026-11-21.md §5），
+ *   5s 已是实测 p99 的十余倍。改前 30s 的代价是：API 抖动时一次检索白等 30 秒才降级，
+ *   而这段等待对用户毫无产出——降级链（本地模型 → 纯 BM25）本来就在后面等着。
+ *   索引构建是批量、非交互、可重试的路径，由调用方显式传更大的超时（见
+ *   vendor/embed/sync-index.mjs），不受这里的默认值影响。
+ *
  * 凭据顺序：环境变量 ALI_API_KEY → DASHSCOPE_API_KEY → $DSH_HOME/.credentials.yaml 的 refs 段。
  * 模型：EMBED_API_MODEL / RERANK_API_MODEL / EMBED_API_DIM 可覆盖。
  */
@@ -83,7 +91,7 @@ function normalize(v) {
   return out
 }
 
-async function post(url, body, { timeoutMs = 30_000, retries = 1 } = {}) {
+async function post(url, body, { timeoutMs = 5_000, retries = 1 } = {}) {
   const key = apiKey()
   if (!key) throw new ApiError('缺少 ALI_API_KEY（环境变量或 .credentials.yaml 均未找到）', 0)
 
@@ -140,7 +148,7 @@ async function post(url, body, { timeoutMs = 30_000, retries = 1 } = {}) {
  * 批量向量化。返回与输入等长的数组，顺序严格对应。
  * 内部先按唯一文本去重再编码，节省 token；返回条数与送出条数必须相等，否则报错。
  */
-export async function embed(texts, { timeoutMs = 30_000 } = {}) {
+export async function embed(texts, { timeoutMs = 5_000, retries = 0 } = {}) {
   const arr = texts.map((t) => String(t ?? ''))
   if (!arr.length) return []
   const uniq = [...new Set(arr)]
@@ -152,7 +160,7 @@ export async function embed(texts, { timeoutMs = 30_000 } = {}) {
       input: batch,
       dimensions: EMBED_DIM,
       encoding_format: 'float',
-    }, { timeoutMs })
+    }, { timeoutMs, retries })
     const data = json?.data || []
     if (data.length !== batch.length) {
       throw new ApiError(`向量返回条数不符：送出 ${batch.length}，返回 ${data.length}（不允许按位置猜）`, 0)
@@ -176,14 +184,14 @@ export async function embedOne(text, opts) {
  * 批量重排：一次请求传完全部候选，返回按分数降序的 [{index, score}]。
  * index 对应传入 documents 的下标。
  */
-export async function rerank(query, documents, { topN, timeoutMs = 30_000, withUsage = false } = {}) {
+export async function rerank(query, documents, { topN, timeoutMs = 5_000, retries = 0, withUsage = false } = {}) {
   const docs = documents.map((d) => String(d ?? ''))
   if (!docs.length) return withUsage ? { results: [], usage: null } : []
   const json = await post(`${BASE}/api/v1/services/rerank/text-rerank/text-rerank`, {
     model: RERANK_MODEL,
     input: { query: String(query ?? ''), documents: docs },
     parameters: { return_documents: false, top_n: Math.min(topN ?? docs.length, docs.length) },
-  }, { timeoutMs })
+  }, { timeoutMs, retries })
   const results = (json?.output?.results || [])
     .map((r) => ({ index: r.index, score: Number(r.relevance_score) }))
     .sort((a, b) => b.score - a.score)

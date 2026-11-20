@@ -28,6 +28,8 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { resolveVault, resolveDbPath, resolveStampPath } from './paths.mjs'
+import { EMBED_MODEL, EMBED_DIM } from './constants.mjs'
+import { contentSignature, writeSig, readSig } from './freshness.mjs'
 
 // 路径唯一真源见 src/paths.mjs（2026-11-20）。这里不再各自算默认值——
 // 原先本文件默认 ~/.memory-vault，与 server.mjs / sync-index.mjs 的默认值不同，
@@ -90,6 +92,53 @@ const CJK = /[\u4e00-\u9fff]/
 // 三种都用于 query 与文档两侧，与官方「索引 -pretokenized + 检索 JWhiteSpaceAnalyzer」同构。
 const TOKENIZER = process.env.MEM_TOKENIZER || 'regex'
 
+// ---- 写入设置校验 ---------------------------------------------------------
+//
+// 机制来源：Resurface `core/write_settings.py` —— 建索引时记下「用的是哪套写入设置」，
+// 启动时比对，不一致就明确报出来，而不是运行到一半崩、或给出静默错误的结果。
+//
+// kb2 的「写入设置」= 决定倒排索引与向量能否互相比对的那几个变量：
+//   tokenizer            —— 分词方式变了，postings 里的 token 全部失效
+//   schema               —— 列结构变了
+//   embedModel/embedDim  —— 向量空间变了，vectors.f32 与新的 query 向量不可比
+// 任何一项与建库时不同，这份索引就不能继续用，必须重建。
+//
+// 为什么不能只靠「缺列就重建」（2026-11-21 之前的做法）：
+//   改 MEM_TOKENIZER 后列一个不缺，但 postings 的 token 语义已经变了。
+//   旧代码会安静地继续用这份索引检索，命中率掉多少没人知道。
+export const SCHEMA_ID = 'cards/atoms/postings/v2'  // v2: atoms 加 fact_key（槽位替换的准备字段）
+
+/** 当前代码期望的写入设置。比对基准，也是 build() 落盘的内容。 */
+export function writeSettings() {
+  return {
+    schema: SCHEMA_ID,
+    tokenizer: TOKENIZER,
+    embedModel: EMBED_MODEL,
+    embedDim: EMBED_DIM,
+    formatVersion: 2,
+  }
+}
+
+/** 读索引里登记的写入设置；老库没有这个键 → null。 */
+export function readWriteSettings(db) {
+  try {
+    const row = db.prepare("SELECT v FROM meta WHERE k='write_settings'").get()
+    return row?.v ? JSON.parse(row.v) : null
+  } catch {
+    return null
+  }
+}
+
+/** 比对，返回不一致项的说明（空数组 = 一致）。 */
+export function diffWriteSettings(stored, desired) {
+  if (!stored) return []
+  const out = []
+  for (const k of Object.keys(desired)) {
+    if (String(stored[k]) !== String(desired[k])) out.push(`${k}: ${stored[k]} → ${desired[k]}`)
+  }
+  return out
+}
+
 /** CJK 感知切词：中文连串 → bigram（+ 长度≤4 时补整串），英文数字 → 小写整词 */
 export function tokenize(text) {
   const s = String(text || '').toLowerCase()
@@ -140,7 +189,7 @@ function parseCardFile(text) {
       const idM = /^ {2}- id:\s*(\S+)/.exec(line)
       if (idM) { if (cur) atoms.push(cur); cur = { id: idM[1], labels: [] }; continue }
       if (!cur) continue
-      const kv = /^ {4}([a-zA-Z]+):\s*(.*)$/.exec(line)
+      const kv = /^ {4}([a-zA-Z_]+):\s*(.*)$/.exec(line)
       if (!kv) continue
       const [, k, vRaw] = kv
       const v = vRaw.replace(/^"(.*)"$/s, '$1').replace(/\\"/g, '"')
@@ -165,7 +214,9 @@ function parseCardFile(text) {
 async function walk(dir, base = dir, acc = []) {
   for (const e of await fs.readdir(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name)
-    if (e.isDirectory()) { if (!['.git', '.index', 'node_modules'].includes(e.name)) await walk(p, base, acc) }
+    // .backup：备份目录不能进索引（2026-11-21 实测：备份 164 张卡后 sync 报 added=167，
+    // 同一张卡在检索里出现两份）。
+    if (e.isDirectory()) { if (!['.git', '.index', 'node_modules', '.backup'].includes(e.name)) await walk(p, base, acc) }
     else if (e.name.endsWith('.md')) acc.push(path.relative(base, p))
   }
   return acc
@@ -186,7 +237,7 @@ function indexCardInto(stmts, rel, text, card, mtimeMs) {
       const tid = 't-' + cid
       const len = (card.title || '').length
       if (len) {
-        insAtom.run(tid, cid, card.title, 'title', 'card', card.status === 'deleted' ? 0 : 1, '', 1, len)
+        insAtom.run(tid, cid, card.title, 'title', 'card', card.status === 'deleted' ? 0 : 1, '', 1, len, null)
         counters.atoms++
         for (const [tok, tf] of tokenize(card.title)) { insPost.run(tok, tid, tf); counters.posts++ }
       }
@@ -195,7 +246,7 @@ function indexCardInto(stmts, rel, text, card, mtimeMs) {
       if (!a.text) continue
       const len = a.text.length
       insAtom.run(a.id, cid, a.text, a.nature || 'fact', a.subject || 'knowledge',
-        a.active === false ? 0 : 1, a.evidence || '', a.conf || 0, len)
+        a.active === false ? 0 : 1, a.evidence || '', a.conf || 0, len, a.fact_key || null)
       counters.atoms++
       for (const [tok, tf] of tokenize(a.text)) { insPost.run(tok, a.id, tf); counters.posts++ }
       for (const t of a.labels || []) insTag.run(a.id, t)
@@ -213,7 +264,7 @@ function indexCardInto(stmts, rel, text, card, mtimeMs) {
         const seg = stripLinks(line.trim())
         if (seg.length < BODY_MIN || seg.length > BODY_MAX) continue
         const bid = 'b-' + crypto.createHash('sha1').update(rel + '|' + seg).digest('hex').slice(0, 10)
-        insAtom.run(bid, cid, seg, 'body', 'body', 1, '', 0.6, seg.length)
+        insAtom.run(bid, cid, seg, 'body', 'body', 1, '', 0.6, seg.length, null)
         counters.atoms++; nBodyAtom++
         for (const [tok, tf] of tokenize(seg)) { insPost.run(tok, bid, tf); counters.posts++ }
       }
@@ -242,7 +293,7 @@ function indexCardInto(stmts, rel, text, card, mtimeMs) {
         const seg = stripLinks(para.replace(/^#{1,6}\s+.*$/gm, ' ').replace(/\s+/g, ' ').trim())
         if (seg.length < BODY_MIN || seg.length > maxLen) continue
         const bid = 'p-' + crypto.createHash('sha1').update(rel + '|' + seg).digest('hex').slice(0, 10)
-        insAtom.run(bid, cid, seg, 'body', 'body', 1, '', 0.6, seg.length)
+        insAtom.run(bid, cid, seg, 'body', 'body', 1, '', 0.6, seg.length, null)
         counters.atoms++
         for (const [tok, tf] of tokenize(seg)) { insPost.run(tok, bid, tf); counters.posts++ }
       }
@@ -258,7 +309,7 @@ export async function build() {
     PRAGMA journal_mode=WAL;
     CREATE TABLE cards (id TEXT PRIMARY KEY, path TEXT, title TEXT, kind TEXT, status TEXT, mtime INTEGER, scope TEXT);
     CREATE TABLE atoms (id TEXT PRIMARY KEY, card_id TEXT, text TEXT, nature TEXT, subject TEXT,
-                        active INTEGER, evidence TEXT, conf REAL, len INTEGER);
+                        active INTEGER, evidence TEXT, conf REAL, len INTEGER, fact_key TEXT);
     CREATE TABLE postings (token TEXT, atom_id TEXT, tf INTEGER, PRIMARY KEY (token, atom_id));
     CREATE TABLE atom_tags (atom_id TEXT, tag TEXT);
     CREATE INDEX idx_postings_token ON postings(token);
@@ -266,7 +317,7 @@ export async function build() {
   `)
   const files = await walk(VAULT)
   const insCard = db.prepare('INSERT OR REPLACE INTO cards (id,path,title,kind,status,mtime,scope) VALUES (?,?,?,?,?,?,?)')
-  const insAtom = db.prepare('INSERT OR REPLACE INTO atoms VALUES (?,?,?,?,?,?,?,?,?)')
+  const insAtom = db.prepare('INSERT OR REPLACE INTO atoms VALUES (?,?,?,?,?,?,?,?,?,?)')
   const insPost = db.prepare('INSERT OR REPLACE INTO postings VALUES (?,?,?)')
   const insTag = db.prepare('INSERT OR REPLACE INTO atom_tags VALUES (?,?)')
 
@@ -287,6 +338,9 @@ export async function build() {
   db.exec(`CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)`)
   db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run('avgdl', String(avg))
   db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run('built_at', new Date().toISOString())
+  // 写入设置：这份索引是「用哪套 tokenizer / 哪个向量空间」建出来的。空库/首次建库
+  // 一定会走到这里，因此不存在「没有登记就查询」的正常路径。
+  db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run('write_settings', JSON.stringify(writeSettings()))
   db.close()
   // 新鲜度标记：memory-server 的 ensureFresh 拿它跟卡片 mtime 比。缺了它，新建的库会被
   // 误判成「落后 56 年」并触发一次无用的后台同步（2026-11-14 实测踩到）。
@@ -294,6 +348,10 @@ export async function build() {
     await fs.mkdir(path.dirname(STAMP_PATH), { recursive: true })
     await fs.writeFile(STAMP_PATH, String(Date.now()), 'utf8')
   } catch {}
+  // 内容签名：记录「这份索引覆盖到 vault 的哪个状态」。检索侧据此判新鲜度，
+  // 不再比较「卡片 max mtime 与进程时钟」——旧做法漏判删卡与 mtime 回退，
+  // 实测 60 次判定误判 20 次（见 src/freshness.mjs 头部注释）。
+  await writeSig(VAULT, await contentSignature(VAULT))
   return { nCards, nAtoms, nPost, avg }
 }
 
@@ -335,6 +393,45 @@ export async function sync({ force = false, dryRun = false } = {}) {
 
   const db = new DatabaseSync(DB_PATH)
   db.exec('PRAGMA journal_mode=WAL')
+  // 2026-11-21：schema 可能由更早的代码建出来（例如同一台机器上还留着旧版脚本，
+  // 两份实现交替写同一个库）。缺列时 INSERT 会抛 "table cards has no column named scope"，
+  // 直接崩掉整个定时同步。这里先校验一次，不匹配就退回全量重建，而不是失败。
+  try {
+    const cols = new Set(db.prepare('PRAGMA table_info(cards)').all().map((r) => r.name))
+    const need = ['id', 'path', 'title', 'kind', 'status', 'mtime', 'scope']
+    const miss = need.filter((c) => !cols.has(c))
+    if (miss.length) {
+      db.close()
+      console.log(`[sync] schema 与当前代码不匹配（cards 缺列：${miss.join(', ')}），改为全量重建`)
+      const r = await build()
+      return { ...stat, added: r.nCards, nCards: r.nCards, nAtoms: r.nAtoms, nPost: r.nPost, avg: r.avg, ms: Date.now() - t0, fullBuild: true, rebuiltReason: `schema-missing-columns: ${miss.join(',')}` }
+    }
+
+    // 写入设置校验（2026-11-21）：列结构对不代表索引语义对。
+    // 改了 MEM_TOKENIZER 后 cards 表一列不缺，但 postings 的 token 已经全部失效，
+    // 旧代码会安静地继续用这份索引检索。这里把差异报出来并全量重建。
+    db.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)')
+    const desired = writeSettings()
+    const stored = readWriteSettings(db)
+    if (stored) {
+      const diff = diffWriteSettings(stored, desired)
+      if (diff.length) {
+        db.close()
+        console.log(`[sync] 写入设置与索引不一致（${diff.join('；')}）→ 索引必须重建`)
+        const r = await build()
+        return { ...stat, added: r.nCards, nCards: r.nCards, nAtoms: r.nAtoms, nPost: r.nPost, avg: r.avg, ms: Date.now() - t0, fullBuild: true, rebuiltReason: `write-settings: ${diff.join('；')}` }
+      }
+    } else {
+      // 老库没有登记（这份校验是后加的，无从回溯历史设置）。以当前代码设置为准
+      // 登记一次，之后任何变更都会被下次比对发现。此处不重建：列结构已通过上面的校验，
+      // 而 tokenizer 的历史一致性无法验证——登记是能做到的最诚实的处理。
+      db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run('write_settings', JSON.stringify(desired))
+      console.log('[sync] 索引缺少写入设置登记，已按当前代码设置回填（历史设置无法回溯）')
+    }
+  } catch (error) {
+    db.close()
+    throw error
+  }
   const indexed = new Map()
   for (const r of db.prepare('SELECT path, mtime FROM cards').all()) indexed.set(r.path, Number(r.mtime) || 0)
 
@@ -354,6 +451,9 @@ export async function sync({ force = false, dryRun = false } = {}) {
     const nAtoms = db.prepare('SELECT COUNT(*) c FROM atoms').get()?.c || 0
     const nPost = db.prepare('SELECT COUNT(*) c FROM postings').get()?.c || 0
     db.close()
+    // 无变化：索引没动，但签名可能还没写过（老索引 / 首次运行）。
+    // 不补写的话检索侧会一直判 stale → 每 60 秒白拉一次 sync，且一直提示「索引落后」。
+    if (!(await readSig(VAULT))) await writeSig(VAULT, await contentSignature(VAULT))
     return { ...stat, nCards, nAtoms, nPost, avg, ms: Date.now() - t0 }
   }
 
@@ -363,7 +463,7 @@ export async function sync({ force = false, dryRun = false } = {}) {
   }
 
   const insCard = db.prepare('INSERT OR REPLACE INTO cards (id,path,title,kind,status,mtime,scope) VALUES (?,?,?,?,?,?,?)')
-  const insAtom = db.prepare('INSERT OR REPLACE INTO atoms VALUES (?,?,?,?,?,?,?,?,?)')
+  const insAtom = db.prepare('INSERT OR REPLACE INTO atoms VALUES (?,?,?,?,?,?,?,?,?,?)')
   const insPost = db.prepare('INSERT OR REPLACE INTO postings VALUES (?,?,?)')
   const insTag = db.prepare('INSERT OR REPLACE INTO atom_tags VALUES (?,?)')
   const stmts = { insCard, insAtom, insPost, insTag }
@@ -414,6 +514,11 @@ export async function sync({ force = false, dryRun = false } = {}) {
     await fs.mkdir(path.dirname(STAMP_PATH), { recursive: true })
     await fs.writeFile(STAMP_PATH, String(Date.now()), 'utf8')
   } catch { /* 标记写失败不影响索引本身 */ }
+
+  // 内容签名：本次真的动了索引（增/改/删）才重算，无变化就沿用旧签名。
+  // 无变化时签名不可能变，重算等于每次同步白遍历一遍全库。
+  const hadChanges = Boolean(stat.added || stat.updated || stat.deleted)
+  if (hadChanges || !(await readSig(VAULT))) await writeSig(VAULT, await contentSignature(VAULT))
 
   return { ...stat, nCards, nAtoms: totalAtoms, nPost: totalPost, avg, ms: Date.now() - t0 }
 }
@@ -733,6 +838,21 @@ export function hybridQuery(q, { limit = 5, qvec = null, k = 60, weights = null,
   const allAtomRows = db.prepare('SELECT id, card_id, text, nature FROM atoms').all()
   const atomText = new Map(allAtomRows.filter((r) => r.nature !== 'title').map((r) => [r.card_id, r.text]))
   const atomInfo = new Map(allAtomRows.map((r) => [r.id, { text: r.text, nature: r.nature }]))
+  // 2026-11-21：把「一张卡的全部实质原子」也取出来。
+  // 为什么需要：只返回命中那 1 条时，读者拿到的是一批互不相关的碎片
+  // （五张卡各一条），无法据此形成判断。而同一张卡的原子本就来自同一次经历，
+  // 按 nature 排好就是一条判断链：boundary（坑/约束）→ fact（前提/机制）
+  // → state（现状）→ plan（下一步）。这是「让材料可推理」而不是「服务端替读者推理」。
+  const CLAIM_ORDER = { boundary: 1, fact: 2, state: 3, plan: 4, preference: 5, body: 6 }
+  const cardAtoms = new Map()
+  for (const r of allAtomRows) {
+    if (r.nature === 'title') continue
+    if (!cardAtoms.has(r.card_id)) cardAtoms.set(r.card_id, [])
+    cardAtoms.get(r.card_id).push({ text: r.text, nature: r.nature })
+  }
+  for (const list of cardAtoms.values()) {
+    list.sort((a, b) => (CLAIM_ORDER[a.nature] || 9) - (CLAIM_ORDER[b.nature] || 9))
+  }
   db.close()
   return {
     mode: qvec ? `hybrid(rrf,${kind})` : 'bm25',
@@ -742,6 +862,8 @@ export function hybridQuery(q, { limit = 5, qvec = null, k = 60, weights = null,
       score: t.score,
       text: atomText.get(t.cardId) || '',
       hitAtoms: [...(hitsByCard.get(t.cardId) || [])].map((id) => atomInfo.get(id)).filter(Boolean).slice(0, 5),
+      // 该卡的完整判断集（已按 boundary→fact→state→plan 排序），供展示层组装「依据」段
+      cardAtoms: (cardAtoms.get(t.cardId) || []).slice(0, 8),
     })),
   }
 }

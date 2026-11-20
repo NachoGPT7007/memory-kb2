@@ -151,7 +151,9 @@ const chunks = []
 const tEnc = Date.now()
 for (let i = 0; i < missing.length; i += BATCH) {
   const batch = missing.slice(i, i + BATCH)
-  const list = await embed(batch.map((r) => r.text))
+  // 索引构建是批量、非交互、可重试的路径：显式放宽超时，不跟随查询侧的 5s 默认值
+  //（一批 10 条，实测通常 200–400ms；网络抖动时留足余量，宁可重试也不要把整库建半截）。
+  const list = await embed(batch.map((r) => r.text), { timeoutMs: 30_000, retries: 1 })
   for (let j = 0; j < batch.length; j++) {
     newIds.push(batch[j].id)
     chunks.push(Buffer.from(new Float32Array(list[j]).buffer))
