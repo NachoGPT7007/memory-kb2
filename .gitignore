@@ -20,3 +20,9 @@ memory-vault/
 .archify/
 docs/assets/*.html
 docs/assets/*.json
+
+# 私人内容：不入库、不公开（2026-11-20）
+# bench/cases-engineering.json 含真实卡片标题；eval/ 是原始评测数据
+bench/cases-engineering.json
+eval/
+.archify/
