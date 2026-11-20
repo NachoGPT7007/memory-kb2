@@ -22,6 +22,7 @@ import os from 'node:os'
 import * as api from './embed-api.mjs'
 import { resolveVault, resolveDbPath } from './paths.mjs'
 import { WEAK_COS } from './constants.mjs'
+import { contentSignature, sigEquals, readSig } from './freshness.mjs'
 
 // ---- 抽取式改写（别名扩展，确定性，零生成）--------------------------------
 // 只作用于词法路：hybridQuery 的 bm25Query 参数把改写限制在 BM25，向量路仍用原 query
@@ -270,39 +271,34 @@ async function summaryOf(relPath) {
 const STAMP = path.join(VAULT, '.index', '.last-sync')
 const SYNC_SCRIPT = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'vendor/embed/sync-index.mjs')
 let lastCheck = 0
-let lastStampSeen = 0
+let lastSigKey = ''
 let syncing = false
 let lastStale = { stale: false, lagMs: 0 }
-
-async function newestMtime(dir, acc = { t: 0 }) {
-  let entries
-  try { entries = await fsp.readdir(dir, { withFileTypes: true }) } catch { return acc }
-  for (const e of entries) {
-    const p = path.join(dir, e.name)
-    if (e.isDirectory()) { if (!['.git', '.index', 'node_modules'].includes(e.name)) await newestMtime(p, acc) }
-    else if (e.name.endsWith('.md')) { try { const st = await fsp.stat(p); if (st.mtimeMs > acc.t) acc.t = st.mtimeMs } catch {} }
-  }
-  return acc
-}
 
 /** 最多每 60 秒真正检查一次；落后则后台拉起 sync（不阻塞当前查询） */
 async function ensureFresh() {
   const now = Date.now()
-  // 2026-11-21 修：原实现 `if (now - lastCheck < 60_000) return lastStale` 会直接返回
-  // 上一轮缓存的 stale 判断。后果：另一个进程（插件 / CLI）刚同步完索引，本进程
-  // 仍在 60 秒内把「索引落后 N 分钟」的旧结论返回给用户，且不会触发重新检查。
-  // 现在即使处于缓存窗口内，也先读一次 STAMP —— 一次小文件读，比 newestMtime
-  // 遍历全库便宜得多；STAMP 变了就说明外部同步过，立即重算。
-  let stampNow = 0
-  try { stampNow = Number(await fsp.readFile(STAMP, 'utf8')) || 0 } catch {}
-  const stampChanged = stampNow !== lastStampSeen
-  if (now - lastCheck < 60_000 && !stampChanged) return lastStale
+  // 判定依据是「内容签名」而不是时间戳（2026-11-21 改，依据见 src/freshness.mjs）：
+  //   旧：stale = 卡片 max mtime > STAMP 里的 Date.now()
+  //       → 删卡不抬高 max mtime，漏判；mtime 回退（复制/时钟回拨）也漏判。
+  //       → 两侧时钟源不同（文件系统 vs 进程），双端写同一 vault 时会静默失效。
+  //   新：stale = 磁盘签名 ≠ 索引记录的签名。两侧都取文件系统属性，粒度到纳秒。
+  //
+  // 缓存窗口内先读一次签名小文件（与原来读 STAMP 同价），变了就立即重算——
+  // 否则另一个进程刚同步完，本进程还会把「落后 N 分钟」的旧结论返回用户。
+  const indexed = await readSig(VAULT)
+  const sigKey = indexed ? `${indexed.count}|${indexed.maxMtimeNs}|${indexed.totalBytes}` : ''
+  if (now - lastCheck < 60_000 && sigKey === lastSigKey) return lastStale
   lastCheck = now
-  lastStampSeen = stampNow
-  const lastSync = stampNow
-  const { t } = await newestMtime(VAULT)
-  const stale = t > lastSync
-  lastStale = { stale, lagMs: Math.max(0, t - lastSync) }
+  lastSigKey = sigKey
+
+  const disk = await contentSignature(VAULT)
+  const stale = !sigEquals(indexed, disk)
+  // lagMs：磁盘最新修改时间与索引记录的时间差，只用于给用户看「落后多久」
+  const diskNs = BigInt(disk.maxMtimeNs || 0)
+  const idxNs = indexed ? BigInt(indexed.maxMtimeNs || 0) : 0n
+  const lagMs = diskNs > idxNs ? Number((diskNs - idxNs) / 1_000_000n) : 0
+  lastStale = { stale, lagMs }
   if (stale && !syncing) {
     syncing = true
     try {
@@ -780,9 +776,17 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const CLAIM_NATURES = new Set(['fact', 'boundary', 'plan', 'state', 'preference'])
       const claimHits = hits.filter((a) => CLAIM_NATURES.has(a.nature)).map((a) => a.text)
       const titleOnly = hits.length > 0 && !bodyHits.length && !claimHits.length
+      // 「依据」优先给该卡的完整判断链（cardAtoms 已按 boundary→fact→state→plan 排好），
+      // 而不是只给命中那一条。2026-11-21：后者会让读者拿到五张卡各一条互不相关的碎片，
+      // 无法据此形成判断；而同一张卡的原子本就来自同一次经历，按 nature 排好即是一条判断链。
+      // 每条前缀标注 nature，让读者知道哪条是坑/约束、哪条是前提、哪条是待办。
+      const NATURE_TAG = { boundary: '坑', fact: '事实', state: '现状', plan: '待办', preference: '偏好', body: '正文' }
+      const chain = (h.cardAtoms || []).filter((a) => a.nature !== 'body').slice(0, 6)
       const show = (claimHits.length ? claimHits : bodyHits).slice(0, 2)
       let hitLine
-      if (show.length) {
+      if (chain.length > 1) {
+        hitLine = '\n依据（判断链）：' + chain.map((a) => `\n  · [${NATURE_TAG[a.nature] || a.nature}] ${String(a.text).slice(0, 150)}`).join('')
+      } else if (show.length) {
         hitLine = `\n依据：${show.map((t) => t.slice(0, 180)).join(' ／ ')}`
       } else if (titleOnly) {
         // 只有标题命中：标题里有这个词不代表内容相关。明确标注，并给一段卡内代表内容
