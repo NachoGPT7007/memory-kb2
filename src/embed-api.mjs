@@ -8,7 +8,7 @@
  *   2) 失败可见：记录最近一次调用的状态码与原因，供 memory_stats 直接显示。
  *   3) 单次超时 + 一次重试：网络抖动不应把整条检索链路打挂。
  *
- * 凭据顺序：环境变量 ALI_API_KEY → DASHSCOPE_API_KEY → ~/.dsh-web-lab/.credentials.yaml 的 refs 段。
+ * 凭据顺序：环境变量 ALI_API_KEY → DASHSCOPE_API_KEY → $DSH_HOME/.credentials.yaml 的 refs 段。
  * 模型：EMBED_API_MODEL / RERANK_API_MODEL / EMBED_API_DIM 可覆盖。
  */
 import { readFileSync } from 'node:fs'
@@ -16,7 +16,8 @@ import path from 'node:path'
 import os from 'node:os'
 
 const BASE = process.env.DASHSCOPE_BASE || 'https://dashscope.aliyuncs.com'
-const CRED_FILE = process.env.DSH_CREDENTIALS || path.join(os.homedir(), '.dsh-web-lab/.credentials.yaml')
+const CRED_FILE = process.env.DSH_CREDENTIALS
+  || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), '.credentials.yaml')
 
 // 2026-11-20：模型名与维度统一走 src/constants.mjs（唯一真源）。
 // 注意必须「先 import 再 re-export」，单独的 `export { X } from` 不会在本模块

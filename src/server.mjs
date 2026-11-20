@@ -56,7 +56,7 @@ function expandAliases(q) {
 }
 
 // vault 解析统一走 src/paths.mjs（2026-11-20 收敛为单一真源）。
-// 解析顺序：显式 MEM_VAULT → $DSH_HOME/memory-vault → ~/.dsh-web-lab/memory-vault → ~/.memory-vault。
+// 解析顺序：显式 MEM_VAULT → $DSH_HOME/memory-vault → ~/.memory-vault。
 // 历史教训：本文件曾与 src/index.mjs、vendor/embed/sync-index.mjs 各自维护一份默认值，
 // 三者不一致导致索引重建与读取指向不同的库，且不报错。
 const VAULT = resolveVault()

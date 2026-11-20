@@ -19,7 +19,7 @@ import { EMBED_MODEL } from '../../src/constants.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 // 2026-11-20 重构：路径不再本地推算，统一走 src/paths.mjs。
-// 历史坑：本文件原来自己算 VAULT，默认 ~/.dsh-web-lab/memory-vault，与
+// 历史坑：本文件原来自己算 VAULT，且默认值与 src/index.mjs 不同，与
 // src/index.mjs 的默认 ~/.memory-vault 不一致；而重建索引是调子进程做的，
 // 又没把 MEM_VAULT 传下去，于是索引建到了空库、时间戳却写回了真 vault。
 const VAULT = resolveVault()

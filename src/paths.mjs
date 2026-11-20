@@ -4,7 +4,7 @@
 //   重构到 src/ 之后，「vault 在哪」这件事被四处各自实现，默认值还互不相同：
 //     src/index.mjs            MEM_VAULT || ~/.memory-vault
 //     src/server.mjs           MEM_VAULT || (DSH_HOME/memory-vault 存在则用它) || ~/.memory-vault
-//     vendor/embed/sync-index  MEM_VAULT || ~/.dsh-web-lab/memory-vault
+//     vendor/embed/sync-index  MEM_VAULT || <本机 DSH 目录>/memory-vault
 //     dsh-memory-kb2 插件       MEM_VAULT / DSH_HOME 的 memory-vault
 //   同一台机器上这产生了一个致命组合：sync-index 自己算对了 vault，但调子进程
 //   重建索引时没传 MEM_VAULT，子进程于是用了 ~/.memory-vault（空目录），把索引
@@ -21,8 +21,10 @@ import path from 'node:path'
 /** 解析顺序（先命中先返回）：
  *  1. MEM_VAULT 环境变量 —— 显式指定，最高优先级（第二个库靠它切换）
  *  2. $DSH_HOME/memory-vault —— DSH 宿主的标准落点
- *  3. ~/.dsh-web-lab/memory-vault —— 本机 WSL 侧实例的落点
- *  4. ~/.memory-vault —— 历史默认值，作为最后兜底
+ *  3. ~/.memory-vault —— 历史默认值，作为最后兜底
+ *
+ * 非 DSH 环境（独立 CLI、定时任务）请显式设 MEM_VAULT：
+ * 这时既没有 DSH_HOME，也没有别的方式知道你用哪个库。
  */
 export function resolveVault() {
   const env = process.env.MEM_VAULT
@@ -31,7 +33,6 @@ export function resolveVault() {
   const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
   const candidates = [
     path.join(dshHome, 'memory-vault'),
-    path.join(os.homedir(), '.dsh-web-lab', 'memory-vault'),
     path.join(os.homedir(), '.memory-vault'),
   ]
   for (const c of candidates) {
