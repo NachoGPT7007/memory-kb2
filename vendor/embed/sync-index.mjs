@@ -8,14 +8,15 @@
 //   node sync-index.mjs           # 同步一次
 //   node sync-index.mjs --check   # 只看差多少，不动
 import { DatabaseSync } from 'node:sqlite'
-import { promises as fs, readFileSync } from 'node:fs'
+import { promises as fs, readFileSync, existsSync as fsSync } from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
-const VAULT = process.env.MEM_VAULT || '/home/nachogpt/.dsh-web-lab/memory-vault'
+const VAULT = process.env.MEM_VAULT || path.join(os.homedir(), '.dsh-web-lab', 'memory-vault')
 const IDX = path.join(VAULT, '.index')
 const DB = path.join(IDX, 'memory.sqlite')
 const VF = path.join(IDX, 'vectors.f32')
@@ -58,7 +59,10 @@ if (lastMs && !process.argv.includes('--force')) {
 // 0.5) 补抽原子 —— 自动沉淀写的是 v1 卡（没有 atoms），不补的话新卡只有标题能搜到。
 //      迁移脚本是幂等的（已有 v2 的卡跳过），所以每次跑都安全。
 try {
-  const mo = execFileSync('node', ['/home/nachogpt/dsh-armory/scripts/memory-migrate-v2.mjs', '--apply'], { encoding: 'utf8' })
+  // 可选迁移脚本（v1 → v2 补抽原子）。本机不存在时跳过，不影响同步。
+  const MIG = process.env.MEM_MIGRATE_SCRIPT || path.join(ROOT, 'scripts', 'memory-migrate-v2.mjs')
+  if (!fsSync.existsSync(MIG)) throw new Error('no migrate script')
+  const mo = execFileSync('node', [MIG, '--apply'], { encoding: 'utf8' })
   const added = mo.match(/新增原子 (\d+) 条/)?.[1] || '0'
   const migrated = mo.match(/迁移 (\d+)/)?.[1] || '0'
   if (added !== '0') console.log(`[0.5/3] 补抽原子：${migrated} 张卡，${added} 条原子`)

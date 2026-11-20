@@ -54,7 +54,7 @@ function expandAliases(q) {
 }
 
 // vault 解析顺序：显式 MEM_VAULT → DSH_HOME/memory-vault（DSH 生态默认）→ ~/.memory-vault。
-// 2026-11-20 补中间一档：旧实现直接把个人路径硬编码进源码（/home/nachogpt/.dsh-web-lab/memory-vault），
+// 2026-11-20 补中间一档：旧实现直接把个人路径硬编码进源码（~/.dsh-web-lab/memory-vault），
 // 换成仓库版后默认值变成 ~/.memory-vault（不存在）→ memory_stats 报 "unable to open database file"。
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const VAULT = process.env.MEM_VAULT
