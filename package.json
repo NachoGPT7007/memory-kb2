@@ -15,7 +15,8 @@
     "selfcheck": "node bin/memory-kb2.mjs selfcheck",
     "serve": "node bin/memory-kb2.mjs serve",
     "test": "node scripts/smoke.mjs",
-    "sync": "node bin/memory-kb2.mjs index --sync"
+    "sync": "node bin/memory-kb2.mjs index --sync",
+    "audit": "node scripts/audit-atoms.mjs"
   },
   "engines": {
     "node": ">=22"
