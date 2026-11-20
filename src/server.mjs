@@ -307,8 +307,29 @@ async function ensureFresh() {
 // 检索命中账本：每次 memory_search 落一行，供 scripts/memory-recall-stats.mjs 做区域加权统计。
 // 只追加、不参与检索；写失败不影响返回。
 const LEDGER = path.join(path.dirname(VAULT), 'memory-recall-ledger.jsonl')
+// 反馈信号（2026-11-20）：同一个账本里 action:'get' 的行表示「这张卡被真正读开了」，
+// 比「被检索命中」更强。检索时给它一个很弱的分数加成——只作为同分/近分时的倾向，
+// 不改变量级、不推翻主排序。MEM_FEEDBACK_BOOST=0 可关闭。
+const FB_BOOST = process.env.MEM_FEEDBACK_BOOST !== '0'
+const FB_ALPHA = Number(process.env.MEM_FEEDBACK_ALPHA) || 0.03
+const readCounts = new Map()
+try {
+  for (const line of readFileSync(LEDGER, 'utf8').split('\n')) {
+    if (!line) continue
+    try {
+      const r = JSON.parse(line)
+      if (r?.action === 'get' && r.path) readCounts.set(r.path, (readCounts.get(r.path) || 0) + 1)
+    } catch {}
+  }
+} catch { /* 账本不存在或不可读时无反馈信号，行为与改动前一致 */ }
+
 async function logRecall(row) {
-  try { await fsp.appendFile(LEDGER, JSON.stringify(row) + '\n') } catch {}
+  try {
+    await fsp.appendFile(LEDGER, JSON.stringify(row) + '\n')
+    if (FB_BOOST && row?.action === 'get' && row.path) {
+      readCounts.set(row.path, (readCounts.get(row.path) || 0) + 1)
+    }
+  } catch {}
 }
 
 // 查询类型判定：概念名（"物债二分"）vs 描述性（"记忆库怎么回滚"）。
@@ -691,6 +712,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     const out = uniqRanked
+    // 反馈加成：被 memory_get 真读过的卡获得极弱加成（对数压缩，α 默认 0.03）。
+    // 只可能让「分数本来就接近」的卡互换，不跨越量级；MEM_FEEDBACK_BOOST=0 关闭。
+    if (FB_BOOST && readCounts.size) {
+      let touched = false
+      for (const h of out) {
+        const n = readCounts.get(h.path) || 0
+        if (n > 0) { h.score = Number(h.score ?? 0) * (1 + FB_ALPHA * Math.log1p(n)); touched = true }
+      }
+      if (touched) out.sort((a, b) => Number(b.score ?? 0) - Number(a.score ?? 0))
+    }
     const ms = Date.now() - t0
     await logRecall({
       ts: new Date().toISOString(),
