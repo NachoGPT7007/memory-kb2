@@ -733,7 +733,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         kind: (h.path || '').split('/')[0] || '',
       })),
     })
-    if (!out.length) return { content: [{ type: 'text', text: `记忆库中没有与「${q}」相关的内容。` }] }
+    if (!out.length) return { content: [{ type: 'text', text: `记忆库中没有与「${q}」相关的内容。\n可以先用 memory_map 看库里有哪些主题与卡片，再换一种说法检索；或降低门槛（limit 调大 / include_deleted: true 查历史结论）。` }] }
     // 卡片元数据（mtime / status）：Agent 要判断「这张是不是我要的那张、还作不作数」，
     // 只给标题和一行片段不够。一次 SQL 批量取，不增加往返、不改排序。
     const cardMeta = new Map()
@@ -802,7 +802,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         ).all(topDir + '/%')
         dbn.close()
         const extra = rows.filter((r) => !got.has(r.path)).slice(0, 3)
-        if (extra.length) notes.push(`同目录（${topDir}）还有未返回的卡，例如：${extra.map((r) => r.title).join('、')}——要读全文用 memory_get`)
+        // 必须带 path：只给标题的话，Agent 要读全文就只能猜路径（实测猜错即断链），
+        // 而要拿到真 path 又得再搜一次，等于白走一轮。
+        if (extra.length) notes.push(`同目录（${topDir}）还有未返回的卡：${extra.map((r) => `${r.title} ＜${r.path}＞`).join('；')}——要读全文直接把 ＜＞ 里的 path 传给 memory_get`)
       }
     } catch { /* 提示失败不影响检索结果 */ }
     const payload = {
