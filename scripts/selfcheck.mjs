@@ -21,6 +21,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { resolveVault } from '../src/paths.mjs'
 
 const HERE = path.dirname(new URL(import.meta.url).pathname)
 const ROOT = path.join(HERE, '..')
@@ -29,7 +30,8 @@ const get = (k, d) => { const i = argv.indexOf('--' + k); return i >= 0 ? argv[i
 const VAULT = get('vault') || process.env.MEM_VAULT
 const SERVE = argv.includes('--serve')
 const CASES = path.join(ROOT, 'bench/chat-memory-benchmark-2.2/adapters/cases_engineering.json')
-const REAL = process.env.MEM_VAULT || path.join(os.homedir(), '.memory-vault')
+// 2026-11-20：路径唯一真源见 src/paths.mjs，不再各自兜底 ~/.memory-vault
+const REAL = resolveVault()
 
 if (!VAULT) { console.error('用法：node scripts/kb2-selfcheck.mjs --vault <库路径> [--serve]'); process.exit(1) }
 const DB = path.join(VAULT, '.index', 'memory.sqlite')

@@ -13,7 +13,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export * from '../src/index.mjs'
-import { build, query, openIndex } from '../src/index.mjs'
+import { build, sync, query, openIndex } from '../src/index.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const isEntry = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(HERE, 'memory-index.mjs')
@@ -24,6 +24,11 @@ if (isEntry) {
   if (argv.includes('--build')) {
     const r = await build()
     console.log(`索引已建：${r.nCards} 卡 / ${r.nAtoms} 原子 / ${r.nPost} 倒排项，avgdl=${r.avg.toFixed(1)}`)
+  } else if (argv.includes('--sync')) {
+    // 增量：只处理新增/修改/删除的卡
+    const r = await sync({ force: argv.includes('--force') })
+    console.log(`索引已同步：新增 ${r.added} / 更新 ${r.updated} / 删除 ${r.deleted} / 跳过 ${r.skipped}（${r.ms} ms）`)
+    console.log(`总计：${r.nCards} 卡 / ${r.nAtoms} 原子 / ${r.nPost} 倒排项，avgdl=${r.avg.toFixed(1)}`)
   } else if (argv.includes('--query')) {
     const q = get('query', '')
     const limit = Number(get('limit', 5))

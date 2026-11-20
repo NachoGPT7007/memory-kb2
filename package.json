@@ -13,7 +13,9 @@
     "search": "node bin/memory-kb2.mjs search",
     "stats": "node bin/memory-kb2.mjs stats",
     "selfcheck": "node bin/memory-kb2.mjs selfcheck",
-    "serve": "node bin/memory-kb2.mjs serve"
+    "serve": "node bin/memory-kb2.mjs serve",
+    "test": "node scripts/smoke.mjs",
+    "sync": "node bin/memory-kb2.mjs index --sync"
   },
   "engines": {
     "node": ">=22"

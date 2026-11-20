@@ -15,6 +15,7 @@
 import { spawnSync } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { resolveVault } from '../src/paths.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -24,10 +25,17 @@ const cmd = argv[0] ?? 'help'
 async function main() {
   switch (cmd) {
     case 'index': {
-      const { build } = await import(join(ROOT, 'src/index.mjs'))
-      const r = await build()
-      console.log(`索引已建：${r.nCards} 卡 / ${r.nAtoms} 原子 / ${r.nPost} 倒排项，avgdl=${r.avg.toFixed(1)}`)
-      console.log(`位置：${process.env.MEM_VAULT ?? '~/.memory-vault'}/.index/memory.sqlite（可随时删除重建）`)
+      const mod = await import(join(ROOT, 'src/index.mjs'))
+      // 默认增量（只处理新增/修改/删除的卡）；--full 强制全量重建。
+      const wantFull = argv.includes('--full')
+      const r = wantFull ? await mod.build() : await mod.sync()
+      if (wantFull) {
+        console.log(`索引已建：${r.nCards} 卡 / ${r.nAtoms} 原子 / ${r.nPost} 倒排项，avgdl=${r.avg.toFixed(1)}`)
+      } else {
+        console.log(`索引已同步：新增 ${r.added} / 更新 ${r.updated} / 删除 ${r.deleted} / 跳过 ${r.skipped}（${r.ms} ms）`)
+        console.log(`总计：${r.nCards} 卡 / ${r.nAtoms} 原子 / ${r.nPost} 倒排项，avgdl=${r.avg.toFixed(1)}`)
+      }
+      console.log(`位置：${join(resolveVault(), '.index', 'memory.sqlite')}（可随时删除重建）`)
       return
     }
 
@@ -66,7 +74,7 @@ async function main() {
       console.log(`原子     : ${N}`)
       console.log(`倒排项   : ${postings}`)
       console.log(`avgdl    : ${avgdl.toFixed(1)}`)
-      console.log(`库路径   : ${process.env.MEM_VAULT ?? '~/.memory-vault'}`)
+      console.log(`库路径   : ${resolveVault()}`)
       return
     }
 
@@ -84,7 +92,7 @@ async function main() {
       console.log(`memory-kb2 —— 本地知识库检索
 
 用法：
-  memory-kb2 index                      建索引（读 $MEM_VAULT，默认 ~/.memory-vault）
+  memory-kb2 index [--sync]             建索引（默认全量重建；--sync 增量，只处理变更）
   memory-kb2 search "查询内容"            命令行检索
   memory-kb2 stats                      库规模与索引状态
   memory-kb2 selfcheck [--serve]        本体体检（--serve 含 MCP 往返，只对副本用）

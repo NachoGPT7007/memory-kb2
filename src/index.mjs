@@ -23,14 +23,19 @@
  *   node scripts/memory-index.mjs --stats
  */
 import { DatabaseSync } from 'node:sqlite'
-import { promises as fs, readFileSync, statSync } from 'node:fs'
+import { promises as fs, readFileSync, statSync, existsSync as fsSyncExists } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
+import { resolveVault, resolveDbPath, resolveStampPath } from './paths.mjs'
 
-const VAULT = process.env.MEM_VAULT || path.join(os.homedir(), '.memory-vault')
-const DB_PATH = process.env.MEM_INDEX || path.join(VAULT, '.index', 'memory.sqlite')
-const STAMP_PATH = path.join(VAULT, '.index', '.last-sync')
+// 路径唯一真源见 src/paths.mjs（2026-11-20）。这里不再各自算默认值——
+// 原先本文件默认 ~/.memory-vault，与 server.mjs / sync-index.mjs 的默认值不同，
+// 导致 sync-index 调子进程重建时把索引建到了空库里，而「最后同步时间」写回了
+// 真 vault，于是真索引永远落后却看起来是最新的。
+const VAULT = resolveVault()
+const DB_PATH = resolveDbPath(VAULT)
+const STAMP_PATH = resolveStampPath(VAULT)
 const K1 = 1.2
 const B = 0.75
 // 标题权重默认值。控制变量实测（2026-11-13，工程 1235 篇 / wiki 941 卡）：
@@ -166,45 +171,24 @@ async function walk(dir, base = dir, acc = []) {
   return acc
 }
 
-export async function build() {
-  await fs.mkdir(path.dirname(DB_PATH), { recursive: true })
-  await fs.rm(DB_PATH, { force: true })
-  const db = new DatabaseSync(DB_PATH)
-  db.exec(`
-    PRAGMA journal_mode=WAL;
-    CREATE TABLE cards (id TEXT PRIMARY KEY, path TEXT, title TEXT, kind TEXT, status TEXT, mtime INTEGER, scope TEXT);
-    CREATE TABLE atoms (id TEXT PRIMARY KEY, card_id TEXT, text TEXT, nature TEXT, subject TEXT,
-                        active INTEGER, evidence TEXT, conf REAL, len INTEGER);
-    CREATE TABLE postings (token TEXT, atom_id TEXT, tf INTEGER, PRIMARY KEY (token, atom_id));
-    CREATE TABLE atom_tags (atom_id TEXT, tag TEXT);
-    CREATE INDEX idx_postings_token ON postings(token);
-    CREATE INDEX idx_atoms_card ON atoms(card_id);
-  `)
-  const files = await walk(VAULT)
-  const insCard = db.prepare('INSERT OR REPLACE INTO cards (id,path,title,kind,status,mtime,scope) VALUES (?,?,?,?,?,?,?)')
-  const insAtom = db.prepare('INSERT OR REPLACE INTO atoms VALUES (?,?,?,?,?,?,?,?,?)')
-  const insPost = db.prepare('INSERT OR REPLACE INTO postings VALUES (?,?,?)')
-  const insTag = db.prepare('INSERT OR REPLACE INTO atom_tags VALUES (?,?)')
-
-  let nCards = 0, nAtoms = 0, nPost = 0
-  db.exec('BEGIN')
-  for (const rel of files) {
-    let text
-    try { text = await fs.readFile(path.join(VAULT, rel), 'utf8') } catch { continue }
-    const card = parseCardFile(text)
-    if (!card) continue
+/**
+ * 把一张卡的标题/原子/正文小节写入索引（全量 build 与增量 sync 共用）。
+ * 调用方负责先清掉该卡在 cards/atoms/postings/atom_tags 里的旧行。
+ */
+function indexCardInto(stmts, rel, text, card, mtimeMs) {
+  const { insCard, insAtom, insPost, insTag } = stmts
+  const counters = { cards: 0, atoms: 0, posts: 0 }
     const cid = crypto.createHash('sha1').update(rel).digest('hex').slice(0, 12)
-    const st = await fs.stat(path.join(VAULT, rel))
-    insCard.run(cid, rel, card.title, card.kind, card.status, Math.round(st.mtimeMs), (card.scope || []).join(','))
-    nCards++
+    insCard.run(cid, rel, card.title, card.kind, card.status, mtimeMs, (card.scope || []).join(','))
+    counters.cards++
     // 标题原子：标题是人/模型都认可的概括，单列一条保证可检索
     {
       const tid = 't-' + cid
       const len = (card.title || '').length
       if (len) {
         insAtom.run(tid, cid, card.title, 'title', 'card', card.status === 'deleted' ? 0 : 1, '', 1, len)
-        nAtoms++
-        for (const [tok, tf] of tokenize(card.title)) { insPost.run(tok, tid, tf); nPost++ }
+        counters.atoms++
+        for (const [tok, tf] of tokenize(card.title)) { insPost.run(tok, tid, tf); counters.posts++ }
       }
     }
     for (const a of card.atoms) {
@@ -212,8 +196,8 @@ export async function build() {
       const len = a.text.length
       insAtom.run(a.id, cid, a.text, a.nature || 'fact', a.subject || 'knowledge',
         a.active === false ? 0 : 1, a.evidence || '', a.conf || 0, len)
-      nAtoms++
-      for (const [tok, tf] of tokenize(a.text)) { insPost.run(tok, a.id, tf); nPost++ }
+      counters.atoms++
+      for (const [tok, tf] of tokenize(a.text)) { insPost.run(tok, a.id, tf); counters.posts++ }
       for (const t of a.labels || []) insTag.run(a.id, t)
     }
     // 正文的「答案型」小节也入库：同一张卡里再切一份段落级原子，
@@ -230,8 +214,8 @@ export async function build() {
         if (seg.length < BODY_MIN || seg.length > BODY_MAX) continue
         const bid = 'b-' + crypto.createHash('sha1').update(rel + '|' + seg).digest('hex').slice(0, 10)
         insAtom.run(bid, cid, seg, 'body', 'body', 1, '', 0.6, seg.length)
-        nAtoms++; nBodyAtom++
-        for (const [tok, tf] of tokenize(seg)) { insPost.run(tok, bid, tf); nPost++ }
+        counters.atoms++; nBodyAtom++
+        for (const [tok, tf] of tokenize(seg)) { insPost.run(tok, bid, tf); counters.posts++ }
       }
     }
     // 兜底：没有 atoms、也没有命中答案型小节的卡（例如 wiki 概念卡的
@@ -259,10 +243,43 @@ export async function build() {
         if (seg.length < BODY_MIN || seg.length > maxLen) continue
         const bid = 'p-' + crypto.createHash('sha1').update(rel + '|' + seg).digest('hex').slice(0, 10)
         insAtom.run(bid, cid, seg, 'body', 'body', 1, '', 0.6, seg.length)
-        nAtoms++
-        for (const [tok, tf] of tokenize(seg)) { insPost.run(tok, bid, tf); nPost++ }
+        counters.atoms++
+        for (const [tok, tf] of tokenize(seg)) { insPost.run(tok, bid, tf); counters.posts++ }
       }
     }
+  return counters
+}
+
+export async function build() {
+  await fs.mkdir(path.dirname(DB_PATH), { recursive: true })
+  await fs.rm(DB_PATH, { force: true })
+  const db = new DatabaseSync(DB_PATH)
+  db.exec(`
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE cards (id TEXT PRIMARY KEY, path TEXT, title TEXT, kind TEXT, status TEXT, mtime INTEGER, scope TEXT);
+    CREATE TABLE atoms (id TEXT PRIMARY KEY, card_id TEXT, text TEXT, nature TEXT, subject TEXT,
+                        active INTEGER, evidence TEXT, conf REAL, len INTEGER);
+    CREATE TABLE postings (token TEXT, atom_id TEXT, tf INTEGER, PRIMARY KEY (token, atom_id));
+    CREATE TABLE atom_tags (atom_id TEXT, tag TEXT);
+    CREATE INDEX idx_postings_token ON postings(token);
+    CREATE INDEX idx_atoms_card ON atoms(card_id);
+  `)
+  const files = await walk(VAULT)
+  const insCard = db.prepare('INSERT OR REPLACE INTO cards (id,path,title,kind,status,mtime,scope) VALUES (?,?,?,?,?,?,?)')
+  const insAtom = db.prepare('INSERT OR REPLACE INTO atoms VALUES (?,?,?,?,?,?,?,?,?)')
+  const insPost = db.prepare('INSERT OR REPLACE INTO postings VALUES (?,?,?)')
+  const insTag = db.prepare('INSERT OR REPLACE INTO atom_tags VALUES (?,?)')
+
+  let nCards = 0, nAtoms = 0, nPost = 0
+  db.exec('BEGIN')
+  for (const rel of files) {
+    let text
+    try { text = await fs.readFile(path.join(VAULT, rel), 'utf8') } catch { continue }
+    const card = parseCardFile(text)
+    if (!card) continue
+    const st = await fs.stat(path.join(VAULT, rel))
+    const c = indexCardInto({ insCard, insAtom, insPost, insTag }, rel, text, card, Math.round(st.mtimeMs))
+    nCards += c.cards; nAtoms += c.atoms; nPost += c.posts
   }
   db.exec('COMMIT')
   // 统计表（avgdl 用）
@@ -278,6 +295,127 @@ export async function build() {
     await fs.writeFile(STAMP_PATH, String(Date.now()), 'utf8')
   } catch {}
   return { nCards, nAtoms, nPost, avg }
+}
+
+/**
+ * 增量同步：只处理「新增 / 修改 / 删除」的卡，不动其余。
+ *
+ * 为什么需要（2026-11-20 全量 debug 实测）：
+ *   原实现只有 build()，每次同步都 fs.rm 删库重建，处理全部卡片。
+ *   504 卡时耗时约 1 秒，但实测「近 1 小时变更」通常只有 10 张（2%），
+ *   日常同步做 98% 的无用功；卡数涨到 3000 张时全量重建会到秒级数倍。
+ *   且 fs.rm 到 CREATE TABLE 之间索引文件不存在，窗口内查询直接失败
+ *   （unable to open database file），WAL 也保护不了「文件被删」。
+ *
+ * 做法：
+ *   1. 扫磁盘得到 { rel: mtimeMs }
+ *   2. 读索引 cards 表得到 { rel: mtime }
+ *   3. 差值 = 新增 + mtime 变化 + 磁盘已删
+ *   4. 对每个变化卡：先删它在 atoms/postings/atom_tags/cards 的旧行，再重新入库
+ *   5. 只在有新原子时才重算 avgdl；没有变化就直接返回
+ *
+ * @param {{force?:boolean, dryRun?:boolean}} opts
+ * @returns {Promise<{added:number,updated:number,deleted:number,skipped:number,nCards:number,nAtoms:number,nPost:number,avg:number,ms:number}>}
+ */
+export async function sync({ force = false, dryRun = false } = {}) {
+  const t0 = Date.now()
+  const stat = { added: 0, updated: 0, deleted: 0, skipped: 0, nCards: 0, nAtoms: 0, nPost: 0, avg: 1, ms: 0 }
+
+  // 索引不存在 → 退回全量构建
+  if (!fsSyncExists(DB_PATH)) {
+    const r = await build()
+    return { ...stat, added: r.nCards, nCards: r.nCards, nAtoms: r.nAtoms, nPost: r.nPost, avg: r.avg, ms: Date.now() - t0, fullBuild: true }
+  }
+
+  const files = await walk(VAULT)
+  const disk = new Map()
+  for (const rel of files) {
+    try { disk.set(rel, Math.round((await fs.stat(path.join(VAULT, rel))).mtimeMs)) } catch { /* 读不到就当不存在 */ }
+  }
+
+  const db = new DatabaseSync(DB_PATH)
+  db.exec('PRAGMA journal_mode=WAL')
+  const indexed = new Map()
+  for (const r of db.prepare('SELECT path, mtime FROM cards').all()) indexed.set(r.path, Number(r.mtime) || 0)
+
+  const toAdd = []
+  const toDelete = []
+  for (const [rel, mtime] of disk) {
+    const old = indexed.get(rel)
+    if (old === undefined) toAdd.push([rel, mtime])
+    else if (force || old !== mtime) toAdd.push([rel, mtime])
+    else stat.skipped++
+  }
+  for (const rel of indexed.keys()) if (!disk.has(rel)) toDelete.push(rel)
+
+  if (!toAdd.length && !toDelete.length) {
+    const avg = Number(db.prepare("SELECT v FROM meta WHERE k='avgdl'").get()?.v) || 1
+    const nCards = indexed.size
+    const nAtoms = db.prepare('SELECT COUNT(*) c FROM atoms').get()?.c || 0
+    const nPost = db.prepare('SELECT COUNT(*) c FROM postings').get()?.c || 0
+    db.close()
+    return { ...stat, nCards, nAtoms, nPost, avg, ms: Date.now() - t0 }
+  }
+
+  if (dryRun) {
+    db.close()
+    return { ...stat, added: toAdd.length, deleted: toDelete.length, ms: Date.now() - t0, dryRun: true }
+  }
+
+  const insCard = db.prepare('INSERT OR REPLACE INTO cards (id,path,title,kind,status,mtime,scope) VALUES (?,?,?,?,?,?,?)')
+  const insAtom = db.prepare('INSERT OR REPLACE INTO atoms VALUES (?,?,?,?,?,?,?,?,?)')
+  const insPost = db.prepare('INSERT OR REPLACE INTO postings VALUES (?,?,?)')
+  const insTag = db.prepare('INSERT OR REPLACE INTO atom_tags VALUES (?,?)')
+  const stmts = { insCard, insAtom, insPost, insTag }
+  // 删一张卡的全部索引行
+  const delPosts = db.prepare('DELETE FROM postings WHERE atom_id IN (SELECT id FROM atoms WHERE card_id=?)')
+  const delTags = db.prepare('DELETE FROM atom_tags WHERE atom_id IN (SELECT id FROM atoms WHERE card_id=?)')
+  const delAtoms = db.prepare('DELETE FROM atoms WHERE card_id=?')
+  const delCard = db.prepare('DELETE FROM cards WHERE id=?')
+
+  const cidOf = (rel) => crypto.createHash('sha1').update(rel).digest('hex').slice(0, 12)
+
+  let nAtoms = 0, nPost = 0
+  db.exec('BEGIN')
+  try {
+    for (const [rel, mtime] of toAdd) {
+      const cid = cidOf(rel)
+      delPosts.run(cid); delTags.run(cid); delAtoms.run(cid); delCard.run(cid)
+      let text
+      try { text = await fs.readFile(path.join(VAULT, rel), 'utf8') } catch { continue }
+      const card = parseCardFile(text)
+      if (!card) continue
+      const c = indexCardInto(stmts, rel, text, card, mtime)
+      nAtoms += c.atoms; nPost += c.posts
+      if (indexed.has(rel)) stat.updated++; else stat.added++
+    }
+    for (const rel of toDelete) {
+      const cid = cidOf(rel)
+      delPosts.run(cid); delTags.run(cid); delAtoms.run(cid); delCard.run(cid)
+      stat.deleted++
+    }
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    db.close()
+    throw error
+  }
+
+  // avgdl 只在原子数变化时重算
+  const avg = db.prepare('SELECT AVG(len) v FROM atoms').get()?.v || 1
+  db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run('avgdl', String(avg))
+  db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run('built_at', new Date().toISOString())
+  const nCards = db.prepare('SELECT COUNT(*) c FROM cards').get()?.c || 0
+  const totalAtoms = db.prepare('SELECT COUNT(*) c FROM atoms').get()?.c || 0
+  const totalPost = db.prepare('SELECT COUNT(*) c FROM postings').get()?.c || 0
+  db.close()
+
+  try {
+    await fs.mkdir(path.dirname(STAMP_PATH), { recursive: true })
+    await fs.writeFile(STAMP_PATH, String(Date.now()), 'utf8')
+  } catch { /* 标记写失败不影响索引本身 */ }
+
+  return { ...stat, nCards, nAtoms: totalAtoms, nPost: totalPost, avg, ms: Date.now() - t0 }
 }
 
 // ---- 查询 ----------------------------------------------------------------
@@ -586,9 +724,15 @@ export function hybridQuery(q, { limit = 5, qvec = null, k = 60, weights = null,
   const top = [...acc.values()].sort((a, b) => b.score - a.score).slice(0, limit)
   const db = new DatabaseSync(DB_PATH, { readOnly: true })
   const info = new Map(db.prepare('SELECT id, path, title, kind FROM cards').all().map((r) => [r.id, r]))
-  const atomRows = db.prepare("SELECT id, card_id, text, nature FROM atoms WHERE nature != 'title'").all()
-  const atomText = new Map(atomRows.map((r) => [r.card_id, r.text]))
-  const atomInfo = new Map(atomRows.map((r) => [r.id, { text: r.text, nature: r.nature }]))
+  // 2026-11-21 修两件事：
+  // 1) hitAtoms 原来查 `WHERE nature != 'title'`，标题命中时为空，展示层只能退回 h.text
+  //    （=该卡第一个非标题原子），给出的「依据」与查询无关。现在 atomInfo 含 title，
+  //    让展示层能区分「仅标题匹配」与「内容真命中」。
+  // 2) atomText 必须继续排除 title：它给的是「卡内代表内容」，若取到标题就等于
+  //    什么都没说，会让「仅标题匹配」的提示退化成标题复读。
+  const allAtomRows = db.prepare('SELECT id, card_id, text, nature FROM atoms').all()
+  const atomText = new Map(allAtomRows.filter((r) => r.nature !== 'title').map((r) => [r.card_id, r.text]))
+  const atomInfo = new Map(allAtomRows.map((r) => [r.id, { text: r.text, nature: r.nature }]))
   db.close()
   return {
     mode: qvec ? `hybrid(rrf,${kind})` : 'bm25',

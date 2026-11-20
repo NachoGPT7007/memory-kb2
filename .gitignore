@@ -27,3 +27,4 @@ bench/cases-engineering.json
 eval/
 .archify/
 *.tgz
+.backup/

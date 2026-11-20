@@ -18,9 +18,12 @@ import os from 'node:os'
 const BASE = process.env.DASHSCOPE_BASE || 'https://dashscope.aliyuncs.com'
 const CRED_FILE = process.env.DSH_CREDENTIALS || path.join(os.homedir(), '.dsh-web-lab/.credentials.yaml')
 
-export const EMBED_MODEL = process.env.EMBED_API_MODEL || 'qwen3.7-text-embedding'
+// 2026-11-20：模型名与维度统一走 src/constants.mjs（唯一真源）。
+// 注意必须「先 import 再 re-export」，单独的 `export { X } from` 不会在本模块
+// 内建立绑定，本文件后面的代码用 X 会 ReferenceError。
+import { EMBED_MODEL, EMBED_DIM } from './constants.mjs'
+export { EMBED_MODEL, EMBED_DIM }
 export const RERANK_MODEL = process.env.RERANK_API_MODEL || 'qwen3.7-text-rerank'
-export const EMBED_DIM = Number(process.env.EMBED_API_DIM) || 1024
 const BATCH = Number(process.env.EMBED_API_BATCH) || 10   // 百炼同步接口单次上限 10 行
 
 export class ApiError extends Error {

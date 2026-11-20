@@ -20,6 +20,8 @@ import { promises as fsp, readFileSync, existsSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import * as api from './embed-api.mjs'
+import { resolveVault, resolveDbPath } from './paths.mjs'
+import { WEAK_COS } from './constants.mjs'
 
 // ---- 抽取式改写（别名扩展，确定性，零生成）--------------------------------
 // 只作用于词法路：hybridQuery 的 bm25Query 参数把改写限制在 BM25，向量路仍用原 query
@@ -53,13 +55,12 @@ function expandAliases(q) {
   return add.length ? `${q} ${[...new Set(add)].join(' ')}` : q
 }
 
-// vault 解析顺序：显式 MEM_VAULT → DSH_HOME/memory-vault（DSH 生态默认）→ ~/.memory-vault。
-// 2026-11-20 补中间一档：旧实现直接把个人路径硬编码进源码（~/.dsh-web-lab/memory-vault），
-// 换成仓库版后默认值变成 ~/.memory-vault（不存在）→ memory_stats 报 "unable to open database file"。
-const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
-const VAULT = process.env.MEM_VAULT
-  || (existsSync(path.join(DSH_HOME, 'memory-vault')) ? path.join(DSH_HOME, 'memory-vault') : path.join(os.homedir(), '.memory-vault'))
-const DB = path.join(VAULT, '.index', 'memory.sqlite')
+// vault 解析统一走 src/paths.mjs（2026-11-20 收敛为单一真源）。
+// 解析顺序：显式 MEM_VAULT → $DSH_HOME/memory-vault → ~/.dsh-web-lab/memory-vault → ~/.memory-vault。
+// 历史教训：本文件曾与 src/index.mjs、vendor/embed/sync-index.mjs 各自维护一份默认值，
+// 三者不一致导致索引重建与读取指向不同的库，且不报错。
+const VAULT = resolveVault()
+const DB = resolveDbPath(VAULT)
 const CACHE = process.env.HF_CACHE || path.join(os.homedir(), '.cache', 'memory-kb2')
 // 2026-11-05 评测：重排候选 10/20/50 的 @1 是 80/82/84、@8 是 86/90/94，单调正向且延迟几乎不涨。
 // 默认取 20（@8 90%），deep 档取 50（@8 94%，成本约 2.5 倍）。
@@ -269,6 +270,7 @@ async function summaryOf(relPath) {
 const STAMP = path.join(VAULT, '.index', '.last-sync')
 const SYNC_SCRIPT = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'vendor/embed/sync-index.mjs')
 let lastCheck = 0
+let lastStampSeen = 0
 let syncing = false
 let lastStale = { stale: false, lagMs: 0 }
 
@@ -286,10 +288,18 @@ async function newestMtime(dir, acc = { t: 0 }) {
 /** 最多每 60 秒真正检查一次；落后则后台拉起 sync（不阻塞当前查询） */
 async function ensureFresh() {
   const now = Date.now()
-  if (now - lastCheck < 60_000) return lastStale
+  // 2026-11-21 修：原实现 `if (now - lastCheck < 60_000) return lastStale` 会直接返回
+  // 上一轮缓存的 stale 判断。后果：另一个进程（插件 / CLI）刚同步完索引，本进程
+  // 仍在 60 秒内把「索引落后 N 分钟」的旧结论返回给用户，且不会触发重新检查。
+  // 现在即使处于缓存窗口内，也先读一次 STAMP —— 一次小文件读，比 newestMtime
+  // 遍历全库便宜得多；STAMP 变了就说明外部同步过，立即重算。
+  let stampNow = 0
+  try { stampNow = Number(await fsp.readFile(STAMP, 'utf8')) || 0 } catch {}
+  const stampChanged = stampNow !== lastStampSeen
+  if (now - lastCheck < 60_000 && !stampChanged) return lastStale
   lastCheck = now
-  let lastSync = 0
-  try { lastSync = Number(await fsp.readFile(STAMP, 'utf8')) || 0 } catch {}
+  lastStampSeen = stampNow
+  const lastSync = stampNow
   const { t } = await newestMtime(VAULT)
   const stale = t > lastSync
   lastStale = { stale, lagMs: Math.max(0, t - lastSync) }
@@ -683,7 +693,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const vec = idx.loadVectors()
         if (vec) {
           const [top] = idx.vectorTopK(qvec, vec, 1)
-          const thr = Number(process.env.MEM_WEAK_COS) || 0.6
+          const thr = WEAK_COS   // 唯一真源：src/constants.mjs
           if (top && Number(top.score) < thr) weakMatch = Number(top.score)
         }
       } catch { /* 向量不可用时不提示，行为与改动前一致 */ }
@@ -760,15 +770,30 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     } catch { /* 元数据取不到不影响检索结果 */ }
     const lines = out.map((h, i) => {
       const score = h.score != null ? ` [${Number(h.score).toFixed(3)}]` : ''
-      // 命中段落优先展示正文答案段（nature=body），没有才退回 frontmatter 原子。
-      // 这样返回的是「为什么匹配」，而不是固定的卡片开头 160 字。
+      // 「依据」只放能直接当结论用的原子。
+      // 2026-11-21：原来 factHits 用 `nature !== 'body'`，把 title 也包含了 ——
+      // 查询词命中标题时，「结论」行就是把标题重复一遍，没有任何可作依据的内容。
+      // 检索结果要能被当作「辅助定位的依据」，标题命中只能说明「标题里出现过这个词」，
+      // 必须让位给实质判断（fact/boundary/plan/state/preference）。
       const hits = h.hitAtoms || []
       const bodyHits = hits.filter((a) => a.nature === 'body').map((a) => a.text)
-      const factHits = hits.filter((a) => a.nature !== 'body').map((a) => a.text)
-      const show = (bodyHits.length ? bodyHits : factHits).slice(0, 2)
-      const hitLine = show.length
-        ? `\n结论：${show.map((t) => t.slice(0, 180)).join(' ／ ')}`
-        : `\n结论：${(h.text || '').slice(0, 180)}`
+      const CLAIM_NATURES = new Set(['fact', 'boundary', 'plan', 'state', 'preference'])
+      const claimHits = hits.filter((a) => CLAIM_NATURES.has(a.nature)).map((a) => a.text)
+      const titleOnly = hits.length > 0 && !bodyHits.length && !claimHits.length
+      const show = (claimHits.length ? claimHits : bodyHits).slice(0, 2)
+      let hitLine
+      if (show.length) {
+        hitLine = `\n依据：${show.map((t) => t.slice(0, 180)).join(' ／ ')}`
+      } else if (titleOnly) {
+        // 只有标题命中：标题里有这个词不代表内容相关。明确标注，并给一段卡内代表内容
+        // 供判断「值不值得读全文」，但必须说清它不是命中片段——否则会被当成依据误用。
+        const fallback = String(h.text || '').slice(0, 140)
+        hitLine = fallback
+          ? `\n依据：（仅标题匹配，以下为卡内代表内容、非命中片段，确认请用 memory_get）${fallback}`
+          : `\n依据：（仅标题匹配，无实质判断可引用——需确认请用 memory_get 读全文）`
+      } else {
+        hitLine = `\n依据：${(h.text || '').slice(0, 180)}`
+      }
       const m = cardMeta.get(h.path)
       const day = m?.mtime ? new Date(m.mtime).toISOString().slice(0, 10) : ''
       // 只在「非正常」状态时才标出来（deleted/rejected/pending），active/approved 是常态、不占位置
