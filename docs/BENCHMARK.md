@@ -147,29 +147,22 @@
 
 ---
 
-## 9. 复现
+## 9. 本地自检
 
 ```bash
 # 建索引
-MEM_VAULT=/path/to/vault node src/index.mjs
+MEM_VAULT=/path/to/vault node scripts/memory-index.mjs --build
 
-# 自检（只读，可指向生产库）
+# 本体体检（只读，可指向生产库）
 node scripts/selfcheck.mjs --vault /path/to/vault
 
-# 工程档（64 条，59 条有效；PASS 判定 93.2 / 100 容差 1 条题）
-node bench/eval-engineering.mjs /tmp/kb2-eng-probe
-
-# PrecisionMemBench（服务层，可选 --alias / --scope）
-node bench/eval-precision.mjs /tmp/pmb --alias --scope
-
-# 法学库两个指标（概念名 recall + 正文细节命中，可指向任意索引）
-node bench/eval-wiki.mjs /tmp/wiki-probe --index /tmp/wiki-probe/.index/memory.sqlite
-
-# 完整检查（含服务层 MCP 往返，只能指向副本）
+# 含服务层 MCP 往返的完整检查（只能指向副本）
 node scripts/selfcheck.mjs --vault /tmp/probe-vault --serve
 ```
 
 自检输出：索引完整性、归档卡规模、候选池不变量、延迟构成、服务层 top1/top3。退出码 0 全通过 / 1 有 FAIL / 2 有 WARN。
+
+**评测数据集不随仓库提供。** 本文所有评测数字来自作者本机的标注集与私有语料，其中标注集含真实卡片标题，属个人数据，不发布。`bench/` 下的脚本保留作方法参考，需自备同格式数据才能运行。
 
 工程库基线（2026-11-14，571 卡）：**top1 93.2% / top3 100%（59 条有效题）**，p50 189 ms、p95 225 ms。
 
@@ -267,7 +260,7 @@ kb2 在 M01 / M02 上跑的是**自建评测**，指标是「evidence 命中率 
 - **工程库的高分不可迁移**：93.2% 来自短标题 + 完整正文的结构（原子/卡 9.4、标题 34.7 字），换成聊天库（原子/卡 2.0）就掉到 48.3%。同一套参数不可能同时服务两种语料——这就是三档 Profile 存在的原因。
 - **没有真实用户数据**：所有数字都来自构造语料与人工标注，没有线上 A/B。
 
-### 10.5 想复现或提交
+### 10.5 想提交到公开榜
 
 题库的评测程序是公开的（`benchmark-2.2/harness`），但**必须走它的评测网关**、每次运行缴押金，且封存集不公开。kb2 若要提交，需要：
 
