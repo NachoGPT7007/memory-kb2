@@ -26,3 +26,4 @@ docs/assets/*.json
 bench/cases-engineering.json
 eval/
 .archify/
+*.tgz
