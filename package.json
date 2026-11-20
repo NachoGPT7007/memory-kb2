@@ -1,12 +1,12 @@
 {
   "name": "memory-kb2",
-  "version": "0.4.0",
+  "version": "0.4.3",
   "description": "MCP 记忆库：BM25 + 语义向量 + RRF 融合的本地知识库检索服务",
   "type": "module",
   "main": "./src/server.mjs",
   "bin": {
-    "memory-kb2": "./bin/memory-kb2.mjs",
-    "memory-kb2-mcp": "./src/server.mjs"
+    "memory-kb2": "bin/memory-kb2.mjs",
+    "memory-kb2-mcp": "src/server.mjs"
   },
   "scripts": {
     "index": "node bin/memory-kb2.mjs index",
