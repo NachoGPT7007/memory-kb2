@@ -78,17 +78,27 @@ const stripLinks = (t) => (STRIP_WIKILINKS ? t.replace(/\[\[([^\]|]+)(?:\|([^\]]
 const STOP = new Set('的了是我在和有就都而及与着不也这那其等或从把被让给对为以中上下个人一'.split(''))
 const CJK = /[\u4e00-\u9fff]/
 
+// 切分方式（2026-11-20 加，用于 CodeRAG 与官方 BM25 对齐的实验）：
+//   regex（默认）：现状，中文 bigram + ASCII 整词，纯数字丢弃
+//   ws：按空白切分（对齐 pyserini 的 JWhiteSpaceAnalyzer），仍保留中文 bigram 与过滤规则
+//   ws_raw：按空白切分且不过滤（最贴近 Lucene whitespace analyzer 的行为）
+// 三种都用于 query 与文档两侧，与官方「索引 -pretokenized + 检索 JWhiteSpaceAnalyzer」同构。
+const TOKENIZER = process.env.MEM_TOKENIZER || 'regex'
+
 /** CJK 感知切词：中文连串 → bigram（+ 长度≤4 时补整串），英文数字 → 小写整词 */
 export function tokenize(text) {
   const s = String(text || '').toLowerCase()
   const out = new Map()
   const add = (t, w = 1) => { if (!t) return; out.set(t, (out.get(t) || 0) + w) }
-  for (const m of s.matchAll(/[\u4e00-\u9fff]+|[a-z0-9][a-z0-9._-]*/g)) {
+  const re = TOKENIZER === 'regex' ? /[\u4e00-\u9fff]+|[a-z0-9][a-z0-9._-]*/g : /\S+/g
+  for (const m of s.matchAll(re)) {
     const tok = m[0]
     if (CJK.test(tok)) {
       if (tok.length === 1) { if (!STOP.has(tok)) add(tok); continue }
       for (let i = 0; i < tok.length - 1; i++) add(tok.slice(i, i + 2))
       if (tok.length <= 4) add(tok)
+    } else if (TOKENIZER === 'ws_raw') {
+      add(tok)
     } else {
       if (tok.length >= 2 && !/^\d+$/.test(tok)) add(tok)
     }
@@ -229,9 +239,24 @@ export async function build() {
     // 否则这类卡只有标题可检索、正文字段为空，BM25F 无从加权。
     if (!card.atoms.length && nBodyAtom === 0) {
       const bodyRaw = text.split(/^---$/m).slice(2).join('')
-      for (const para of bodyRaw.split(/\n\s*\n/)) {
+      // 整卡入库 vs 按空行切段落。
+      //
+      // 代码卡片（kind: code）必须整卡入库：代码没有 Markdown 小节，会落进这条兜底路径，
+      // 而按空行切会把一个 function 拆成平均 11.6 个段落原子。原子级 BM25 的后果是三重的——
+      // 长度归一化基准从「函数」变成「段落」、tf 不跨段累加、idf 的 N 从文档数变成原子数（差 11.6 倍）。
+      // 2026-11-20 在 CodeRAG-Bench RepoEval（373 条）实测：
+      //   默认（空行切段）nDCG@10 = 87.5；整卡入库（+空白分词+关覆盖率折扣）= 93.2，
+      //   与论文 Table 3 的 BM25 基线 93.2 持平。整卡入库这一步单独贡献 +3.2pp（90.0 → 93.2）。
+      // 卡片语料（knowledge/mistake/tool/...）不受影响：它们有 Markdown 小节，不走这条路径；
+      // 实测把 MEM_BODY_WHOLE=1 强加到生产库会让 top3 从 100% 掉到 98.3%，所以只对 kind: code 生效。
+      // MEM_BODY_WHOLE=1 仍保留为强制开关，供无小节结构的其他纯文本文料使用（会伤害卡片语料）。
+      const wholeBody = process.env.MEM_BODY_WHOLE === '1' || card.kind === 'code'
+      // 整卡入库时放宽长度上限，否则超过 BODY_MAX(400) 的函数会被整条丢掉。
+      const maxLen = wholeBody ? Math.max(BODY_MAX, 200000) : BODY_MAX
+      const paras = wholeBody ? [bodyRaw] : bodyRaw.split(/\n\s*\n/)
+      for (const para of paras) {
         const seg = stripLinks(para.replace(/^#{1,6}\s+.*$/gm, ' ').replace(/\s+/g, ' ').trim())
-        if (seg.length < BODY_MIN || seg.length > BODY_MAX) continue
+        if (seg.length < BODY_MIN || seg.length > maxLen) continue
         const bid = 'p-' + crypto.createHash('sha1').update(rel + '|' + seg).digest('hex').slice(0, 10)
         insAtom.run(bid, cid, seg, 'body', 'body', 1, '', 0.6, seg.length)
         nAtoms++

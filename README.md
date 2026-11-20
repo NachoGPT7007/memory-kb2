@@ -115,15 +115,53 @@ flowchart TB
 
 ## Quick start
 
-### 安装（两种，都不用等 npm 审核）
+### 安装
 
 ```bash
-# 推荐：直接从仓库装（npm registry 上暂时没有这个包）
-npm install -g github:NachoGPT7007/memory-kb2
+npm install -g memory-kb2        # 需要 Node ≥ 22
+```
 
-# 或者 clone 下来用
+想跟最新提交或改代码，用仓库：
+
+```bash
 git clone https://github.com/NachoGPT7007/memory-kb2 && cd memory-kb2 && npm install
 ```
+
+Node 22 起才有内置的 `node:sqlite`——这是「零外部检索依赖」的前提，版本不够直接装不上。
+
+### 第一次用：还没有 vault
+
+`MEM_VAULT` 指向的目录就是库。**它不会替你挑内容**：没有卡片就没有记忆可检索，索引再新也是空的。
+
+```bash
+mkdir -p ~/notes          # 1. 准备目录，放 2–3 个 .md 卡片
+MEM_VAULT=~/notes memory-kb2 index                 # 2. 建索引
+MEM_VAULT=~/notes memory-kb2 search "某个结论"      # 3. 确认查得出来
+```
+
+一张卡最少是这样——`title` 加上回答型小节（`结论` / `要点` / `根因` 等标题下的正文才进索引）：
+
+```markdown
+---
+title: 检索融合为什么用 RRF
+status: active
+---
+
+## 结论
+
+BM25 分数没有上界，向量相似度在 [0,1]，两路不可比。排名是唯一共同的度量。
+```
+
+两张现成的卡在 [`examples/minimal-vault`](./examples/minimal-vault)，可以直接照抄结构。
+
+**空库的两种表现不一样，别混**（2026-11-20 实测）：
+
+| 入口 | 行为 |
+|---|---|
+| `memory-kb2 index` 指向不存在的目录 | **exit 0**，建出 0 卡 / 0 原子的空索引；之后 `search` 全部无命中，但**不报错** |
+| MCP `memory_stats` / `memory_search`，索引文件不存在 | 工具错误 `unable to open database file` |
+
+所以「查不到东西」先看 `memory-kb2 stats` 的卡片数：0 卡是没放卡，不是检索坏了。
 
 ### 命令行：给人用
 
@@ -140,8 +178,9 @@ memory-kb2 selfcheck                  # 本体体检
 MEM_VAULT=~/notes memory-kb2 index
 ```
 
-不设 `MEM_VAULT` 时按这个顺序找：`$DSH_HOME/memory-vault` → `~/.memory-vault`。
-两个都不存在时 `index` 会报错并提示路径——不会静默建一个空库。
+不设 `MEM_VAULT` 时**两个入口的查找顺序不同**：MCP 服务按 `$DSH_HOME/memory-vault` → `~/.memory-vault` 依次找；
+CLI（`index` / `search` / `stats`）只认 `MEM_VAULT` 或 `~/.memory-vault`，不看 `DSH_HOME`。
+要避免这种歧义，就显式写 `MEM_VAULT`。
 
 ### MCP 客户端：给 AI 用
 
@@ -159,8 +198,26 @@ MEM_VAULT=~/notes memory-kb2 index
 }
 ```
 
-`env` 里那一行可以省略——省略时按上面的顺序自动找库。
+`env` 里那一行建议写上——省略时 MCP 服务按 `$DSH_HOME/memory-vault` → `~/.memory-vault` 找。
 一个 MCP 进程绑一个库；要同时查多个库，就按库起多个实例（同一条命令，换 `MEM_VAULT`）。
+
+---
+
+## 不适合用它做什么
+
+这份清单来自实验记录，不是免责声明——每一条都有对应的失败数字或未实现的环节：
+
+| 场景 | 为什么不适合 | 证据 |
+|---|---|---|
+| 长文档问答 / 全文检索 | 输入单位是卡片切成的小节原子，不是 PDF 或长文。要查长文，得先把结论写成卡 | 正文只收「结论 / 要点 / 根因」这类回答型小节，叙述性正文不进索引 |
+| 代码检索 | 中文二元组分词对代码结构无效，别拿它替代 grep | CodeRAG-Bench RepoEval：nDCG@10 **88.0**，Lucene BM25 **93.2**（输 5.2） |
+| 需要多段 evidence 拼答案 | 一题一段时 top1 93.2%；一题要多段拼接时，证据覆盖率中位数只有 0.50 | chat-memory-benchmark 2.2 实测 A 39.2，低于基线 45.1 |
+| 多用户 / 并发写 | 一个 vault 一个 SQLite 文件，写入靠整体重建索引；没有权限模型、没有租户隔离 | 未实现 |
+| 自动沉淀记忆 | 不会自己从对话里抽卡。只有 `memory_update` 让人显式追加修正或标记失效 | 未实现 |
+| 图文 / 多模态 | 只索引文本 | 未实现 |
+
+**它擅长的是**一题一段的精准召回——查一个配置、一条决策、一次排障记录、一个概念的定义。
+这类查询上工程库 top1 93.2% / top3 100%，法学概念名 recall@1 98.9%。
 
 ---
 
@@ -178,6 +235,29 @@ MEM_VAULT=~/notes memory-kb2 index
 完整数据集、指标定义与全部实验数字见 [docs/BENCHMARK.md](./docs/BENCHMARK.md)。
 
 **本项目没有向公开榜提交过成绩。** PrecisionMemBench（纯检索断言基准）实测 10/76 = 13.2%——与官方基线（Qwen3 14.3%、Hindsight 14.3%、Mem0 11.7%）持平——详见 [BENCHMARK 第 11 节](./docs/BENCHMARK.md)。 与 chat-memory-benchmark 1.0 / 2.2 的关系、以及为什么自测数字不能直接和榜上 A 分比较，写在 [BENCHMARK 第 10 节](./docs/BENCHMARK.md)——那一节也列出了聊天域偏弱、只在两个合成人物上测过这些坏消息。
+
+---
+
+## 换库要重标参数
+
+下面的默认值是从三个真实库（工程 571 卡 / 法学 wiki 941 卡 / 聊天 5413 卡）调出来的，不是普适最优。
+换一份语料，这几项最先失效：
+
+| 参数 | 默认 | 覆盖方式 | 为哪类语料调的 |
+|---|---|---|---|
+| `titleW` | 3.0（档位）/ 1.3（库函数兜底） | `MEM_TITLE_W` | 标题即答案的概念卡。概念名查询 1.0→2.0：工程 93.0%→99.6%、法学 80.1%→95.9%；描述性查询相反，3.0 时 −3.4pp |
+| `pool` | `clamp(1.09·√cards, 20, 80)` | `MEM_POOL` / `MEM_POOL_MIN` / `MEM_POOL_MAX` | 拟合点只有两个（571→26、5413→80）。卡数落在中间地带时，这条曲线没有实测支撑 |
+| 档位阈值 | 标题均长 15 字 · 原子/卡 3 · 正文均长 800 字 | 不自动，用显式环境变量压过档位 | 三个库的分界；第四个库落在哪一档，没验证过 |
+| 正文小节词表 | `排障 / 要点 / 结论 / 根因 …` | `MEM_BODY_SECTIONS` | 默认词表是工程与聊天语域。法学卡章节名（体系位置 / 内容 / 效果 / 例外与争议）一条都不匹配，385 万字正文因此零入索引——**换领域必查这一项** |
+
+**重标顺序别反过来：**
+
+1. 看现状：卡片数用 `memory-kb2 stats`；**判成哪一档只有 MCP `memory_search` 的返回头会打印**（形如 `engineering档·标题权×3`），CLI 不显示档位
+2. 自己标 **50 条以上**查询——低于 50 条不下结论，这是本项目的硬规则（15 条时看到的 +7pp，扩到 59 条变成打平）
+3. 跑一次基线 top1 / top3，再**一次只动一个参数**
+4. 只保留方向一致、幅度超过噪声的改动
+
+不重标不一定会坏。坏的是出了问题你分不清是参数、语料，还是卡本身写得不行。
 
 ---
 
